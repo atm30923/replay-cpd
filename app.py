@@ -41,6 +41,8 @@ DEFAULTS = {
     "music_show_more": False,
     "play_memory": None,
     "selected_memory_id": None,
+    "album_category": "",
+    "album_selected_memory_id": None,
     "upload_signature": None,
     "memory_text": "",
     "handwriting_path": None,
@@ -76,6 +78,8 @@ def reset_flow():
     st.session_state.spotify_query = ""
     st.session_state.music_show_more = False
     st.session_state.play_memory = None
+    st.session_state.album_category = ""
+    st.session_state.album_selected_memory_id = None
     st.session_state.upload_signature = None
     st.session_state.memory_text = ""
     st.session_state.handwriting_path = None
@@ -369,6 +373,89 @@ def load_memories():
     return memories
 
 
+def memory_categories(memory):
+    values = []
+    raw_categories = memory.get("categories")
+    if isinstance(raw_categories, list):
+        values.extend(raw_categories)
+    elif isinstance(raw_categories, str):
+        values.extend(raw_categories.split(","))
+    raw_category = memory.get("category")
+    if raw_category:
+        values.extend(str(raw_category).split(","))
+
+    categories = []
+    for value in values:
+        category = str(value).strip()
+        if category and category not in categories:
+            categories.append(category)
+    return categories
+
+
+def album_category_from_state(memory=None):
+    explicit = str(st.session_state.get("album_category") or "").strip()
+    if explicit:
+        return explicit
+    selected_categories = st.session_state.get("selected_categories")
+    if isinstance(selected_categories, list) and selected_categories:
+        return str(selected_categories[0]).strip()
+    selected = str(st.session_state.get("selected_category") or "").strip()
+    if selected:
+        return selected.split(",")[0].strip()
+    categories = memory_categories(memory or {})
+    return categories[0] if categories else ""
+
+
+def album_memories_for_category(category):
+    all_memories = load_memories()
+    if category:
+        filtered = [memory for memory in all_memories if category in memory_categories(memory)]
+        if filtered:
+            return filtered
+    selected_id = st.session_state.get("album_selected_memory_id") or st.session_state.get("selected_memory_id")
+    if selected_id:
+        picked = [memory for memory in all_memories if memory.get("id") == selected_id]
+        if picked:
+            return picked
+    return all_memories[:1]
+
+
+def photo_path_for_memory(memory):
+    candidates = [memory.get("photo")]
+    memory_id = memory.get("id")
+    if memory_id:
+        candidates.append(os.path.join(PHOTO_DIR, f"{memory_id}.jpg"))
+    for path in candidates:
+        if path and os.path.exists(path):
+            return path
+    return None
+
+
+def select_album_memory(memory_id):
+    picked = next((memory for memory in load_memories() if memory.get("id") == memory_id), None)
+    if not picked:
+        return
+    st.session_state.album_selected_memory_id = memory_id
+    st.session_state.selected_memory_id = memory_id
+    st.session_state.play_memory = picked
+    st.session_state.memory_id = memory_id
+    st.session_state.photo_path = photo_path_for_memory(picked)
+    st.session_state.memory_text = picked.get("note", st.session_state.get("memory_text", ""))
+    st.session_state.handwriting_path = picked.get("handwriting") or handwriting_path_for(memory_id)
+    st.session_state.selected_categories = memory_categories(picked)
+    st.session_state.selected_category = ", ".join(st.session_state.selected_categories)
+    if not st.session_state.get("album_category") and st.session_state.selected_categories:
+        st.session_state.album_category = st.session_state.selected_categories[0]
+
+
+def open_category_album(category=None, memory_id=None):
+    if category:
+        st.session_state.album_category = category
+    if memory_id:
+        select_album_memory(memory_id)
+    st.session_state.page = "video"
+
+
 def active_memory():
     memory = st.session_state.get("play_memory") or {}
     memory_id = memory.get("id") or st.session_state.get("selected_memory_id") or st.session_state.get("memory_id")
@@ -578,19 +665,24 @@ if action:
             st.session_state.questions = picked.get("questions") or [st.session_state.question]
             st.session_state.selected_category = picked.get("category") or st.session_state.selected_category
             st.session_state.selected_categories = picked.get("categories") or ([st.session_state.selected_category] if st.session_state.selected_category else [])
-        st.session_state.page = "video"
+            categories = memory_categories(picked)
+            st.session_state.album_category = categories[0] if categories else ""
+            st.session_state.album_selected_memory_id = memory_id
+        open_category_album(st.session_state.get("album_category"), memory_id)
     elif action == "playback":
         picked = next((m for m in memories if m.get("id") == st.session_state.selected_memory_id), None)
         if picked:
             st.session_state.play_memory = picked
             st.session_state.selected_category = picked.get("category") or st.session_state.selected_category
             st.session_state.selected_categories = picked.get("categories") or ([st.session_state.selected_category] if st.session_state.selected_category else [])
-            st.session_state.page = "video"
+            categories = memory_categories(picked)
+            open_category_album(categories[0] if categories else st.session_state.selected_category, picked.get("id"))
         elif memories:
             st.session_state.play_memory = memories[0]
             st.session_state.selected_category = memories[0].get("category") or st.session_state.selected_category
             st.session_state.selected_categories = memories[0].get("categories") or ([st.session_state.selected_category] if st.session_state.selected_category else [])
-            st.session_state.page = "video"
+            categories = memory_categories(memories[0])
+            open_category_album(categories[0] if categories else st.session_state.selected_category, memories[0].get("id"))
         else:
             reset_flow()
             st.session_state.page = "scan_upload"
@@ -623,9 +715,9 @@ if action:
     elif action == "nfc_done":
         st.session_state.page = "nfc_done"
     elif action == "video":
-        st.session_state.page = "video"
+        open_category_album(album_category_from_state(st.session_state.get("play_memory") or {}), st.session_state.get("selected_memory_id"))
     elif action == "player":
-        st.session_state.page = "video"
+        open_category_album(album_category_from_state(st.session_state.get("play_memory") or {}), st.session_state.get("selected_memory_id"))
     elif action == "delete" and memory_id:
         delete_memory(memory_id)
         st.session_state.play_memory = None
@@ -1537,19 +1629,22 @@ div[data-testid="stAudio"] { margin: 6px 0 10px !important; }
 elif page == "category_loading":
     st.markdown("""
 <style>
-.stApp { background:#efefef !important; }
-.block-container { max-width:760px !important; min-height:430px !important; margin:24px auto 0 !important; padding:0 !important; background:#fff !important; overflow:hidden !important; }
+.stApp, html, body { background:#efefef !important; overflow:hidden !important; }
+.block-container { max-width:none !important; width:100vw !important; height:100vh !important; min-height:100vh !important; margin:0 !important; padding:0 !important; background:#efefef !important; overflow:hidden !important; }
 header, [data-testid="stToolbar"], [data-testid="stDecoration"], #MainMenu, footer { display:none !important; }
-.category-loading { height:430px; position:relative; display:flex; flex-direction:column; align-items:center; justify-content:center; text-align:center; background:#fff; overflow:hidden; }
+.category-loading-overlay { position:fixed; inset:0; z-index:999999; background:#efefef; display:flex; justify-content:center; align-items:flex-start; padding-top:18px; overflow:hidden; }
+.category-loading { width:760px; max-width:calc(100vw - 32px); height:calc(100vh - 36px); min-height:430px; position:relative; display:flex; flex-direction:column; align-items:center; justify-content:center; text-align:center; background:#fff; overflow:hidden; }
 .category-loading::after { content:""; position:absolute; width:210px; height:210px; left:50%; bottom:-70px; transform:translateX(-50%); border-radius:50%; background:radial-gradient(circle, rgba(255,104,32,.85), rgba(255,104,32,.25) 32%, rgba(255,104,32,0) 72%); filter:blur(3px); }
 .ai-chip { height:28px; padding:0 18px; border-radius:999px; background:#fff; box-shadow:0 8px 18px rgba(0,0,0,.08); display:flex; align-items:center; justify-content:center; font-size:11px; font-weight:900; margin-bottom:24px; position:relative; z-index:2; }
 .category-loading h2 { margin:0; font-size:18px; line-height:1.55; position:relative; z-index:2; }
 </style>
 """, unsafe_allow_html=True)
     html("""
-<div class="category-loading">
-  <div class="ai-chip">AI 생성</div>
-  <h2>AI가 당신의 추억을 분석해<br>카테고리를 추천했어요</h2>
+<div class="category-loading-overlay">
+  <div class="category-loading">
+    <div class="ai-chip">AI 생성</div>
+    <h2>AI가 당신의 추억을 분석해<br>카테고리를 추천했어요</h2>
+  </div>
 </div>
 """)
     time.sleep(2.4)
@@ -1730,11 +1825,42 @@ elif page == "album_done":
     track_title = escape(track.get("title") or "노래 제목")
     track_artist = escape(track.get("artist") or "가수")
     preview_url = track.get("preview_url") or ""
-    song_audio = (
-        f'<audio class="mini-audio" controls src="{escape(preview_url, quote=True)}"></audio>'
-        if preview_url
-        else '<div class="fake-player"><div class="fake-line"><span></span></div><div class="fake-controls">× ‹ ● › ↻</div></div>'
-    )
+    if preview_url:
+        song_audio = """
+<div class="custom-player">
+  <audio preload="metadata" src="__PREVIEW_URL__"
+    onloadedmetadata="const p=this.closest('.custom-player');const d=Number.isFinite(this.duration)&&this.duration>0?this.duration:30;p.querySelector('.player-end').textContent='-'+(Math.floor(d/60)+':'+String(Math.floor(d%60)).padStart(2,'0'));"
+    ontimeupdate="const p=this.closest('.custom-player');const d=Number.isFinite(this.duration)&&this.duration>0?this.duration:30;const c=this.currentTime||0;p.querySelector('.player-fill').style.width=Math.max(0,Math.min(100,(c/d)*100))+'%';p.querySelector('.player-now').textContent=Math.floor(c/60)+':'+String(Math.floor(c%60)).padStart(2,'0');const r=Math.max(d-c,0);p.querySelector('.player-end').textContent='-'+(Math.floor(r/60)+':'+String(Math.floor(r%60)).padStart(2,'0'));"
+    onplay="this.closest('.custom-player').querySelector('.player-play').textContent='Ⅱ';"
+    onpause="this.closest('.custom-player').querySelector('.player-play').textContent='▶';"
+    onended="this.closest('.custom-player').querySelector('.player-play').textContent='▶';"></audio>
+  <div class="player-bar" onclick="const p=this.closest('.custom-player');const a=p.querySelector('audio');if(a.duration){const r=this.getBoundingClientRect();a.currentTime=((event.clientX-r.left)/r.width)*a.duration;}">
+    <span class="player-fill"></span>
+  </div>
+  <div class="player-time"><span class="player-now">0:00</span><span class="player-end">-0:30</span></div>
+  <div class="player-controls">
+    <button type="button" onclick="const a=this.closest('.custom-player').querySelector('audio');a.currentTime=0;">⇄</button>
+    <button type="button" onclick="const a=this.closest('.custom-player').querySelector('audio');a.currentTime=Math.max(0,(a.currentTime||0)-10);">◀</button>
+    <button type="button" class="player-play" onclick="const a=this.closest('.custom-player').querySelector('audio');if(a.paused){a.play();this.textContent='Ⅱ';}else{a.pause();this.textContent='▶';}">Ⅱ</button>
+    <button type="button" onclick="const a=this.closest('.custom-player').querySelector('audio');a.currentTime=Math.min(a.duration||30,(a.currentTime||0)+10);">▶</button>
+    <button type="button" onclick="const a=this.closest('.custom-player').querySelector('audio');a.currentTime=0;a.play();">↻</button>
+  </div>
+</div>
+""".replace("__PREVIEW_URL__", escape(preview_url, quote=True))
+    else:
+        song_audio = """
+<div class="custom-player disabled">
+  <div class="player-bar"><span class="player-fill disabled-fill"></span></div>
+  <div class="player-time"><span>0:00</span><span>-0:00</span></div>
+  <div class="player-controls">
+    <button type="button" disabled>⇄</button>
+    <button type="button" disabled>◀</button>
+    <button type="button" class="player-play" disabled>Ⅱ</button>
+    <button type="button" disabled>▶</button>
+    <button type="button" disabled>↻</button>
+  </div>
+</div>
+"""
     handwriting_src = image_src(active_handwriting_path(memory))
     handwriting = f'<img src="{handwriting_src}">' if handwriting_src else escape(memory.get("note") or st.session_state.memory_text or "")
     category_pills = "".join(
@@ -1756,13 +1882,20 @@ header, [data-testid="stToolbar"], [data-testid="stDecoration"], #MainMenu, foot
 .album-card-title {{ font-size:11px; font-weight:900; margin-bottom:10px; }}
 .album-note {{ height:150px; display:flex; align-items:center; justify-content:center; font-size:27px; font-weight:500; color:#333; }}
 .album-note img {{ max-width:100%; max-height:100%; object-fit:contain; }}
-.song-box {{ background:#ffe5d3; min-height:150px; }}
+.song-box {{ background:#ffe5d3; min-height:210px; }}
 .song-heart {{ float:right; font-size:18px; }}
-.mini-audio {{ width:100%; height:34px; margin-top:28px; }}
-.fake-player {{ margin-top:28px; }}
-.fake-line {{ height:2px; background:rgba(0,0,0,.18); position:relative; margin-bottom:10px; }}
-.fake-line span {{ position:absolute; left:0; top:0; bottom:0; width:62%; background:#ef7d34; }}
-.fake-controls {{ display:flex; justify-content:center; gap:14px; align-items:center; font-size:14px; font-weight:900; }}
+.custom-player {{ margin-top:26px; }}
+.custom-player audio {{ display:none; }}
+.player-bar {{ position:relative; height:3px; border-radius:999px; background:rgba(0,0,0,.20); cursor:pointer; }}
+.player-fill {{ position:absolute; left:0; top:0; bottom:0; width:0%; border-radius:999px; background:#ef7d34; }}
+.disabled-fill {{ width:58%; }}
+.player-time {{ display:flex; justify-content:space-between; margin-top:6px; color:#c0aaa0; font-size:10px; line-height:1; }}
+.player-controls {{ display:flex; align-items:center; justify-content:space-between; margin-top:18px; padding:0 12px; }}
+.player-controls button {{ width:24px; height:24px; display:flex; align-items:center; justify-content:center; border:0; padding:0; margin:0; background:transparent; color:#81756f; font-size:16px; font-weight:900; line-height:1; cursor:pointer; }}
+.player-controls .player-play {{ width:42px; height:42px; border-radius:999px; background:#877b73; color:#fff; font-size:20px; letter-spacing:-2px; box-shadow:0 7px 14px rgba(0,0,0,.12); }}
+.custom-player.disabled {{ opacity:.48; }}
+.custom-player.disabled button,
+.custom-player.disabled .player-bar {{ cursor:default; }}
 .category-box {{ background:#f2fff0; min-height:132px; }}
 .category-pill-row {{ display:flex; gap:12px; margin-top:12px; flex-wrap:wrap; }}
 .category-pill {{ min-width:82px; height:24px; padding:0 14px; border-radius:999px; background:#fff; display:flex; align-items:center; justify-content:center; font-size:10px; font-weight:900; box-shadow:0 6px 14px rgba(0,0,0,.06); }}
@@ -1850,8 +1983,28 @@ header, [data-testid="stToolbar"], [data-testid="stDecoration"], #MainMenu, foot
     go("video")
 
 elif page == "video":
-    memory = active_memory()
-    photo_path = active_photo_path(memory)
+    base_memory = active_memory()
+    album_category = album_category_from_state(base_memory)
+    st.session_state.album_category = album_category
+    album_memories = album_memories_for_category(album_category)
+    if not album_memories and base_memory.get("photo"):
+        album_memories = [base_memory]
+
+    selected_album_id = (
+        st.session_state.get("album_selected_memory_id")
+        or st.session_state.get("selected_memory_id")
+        or base_memory.get("id")
+    )
+    if album_memories and selected_album_id not in [item.get("id") for item in album_memories]:
+        selected_album_id = album_memories[0].get("id")
+    if selected_album_id:
+        select_album_memory(selected_album_id)
+
+    memory = next(
+        (item for item in album_memories if item.get("id") == selected_album_id),
+        st.session_state.get("play_memory") or base_memory or {},
+    )
+    photo_path = photo_path_for_memory(memory) or active_photo_path(memory)
     photo_src = image_src(photo_path)
     photo = f'<img src="{photo_src}">' if photo_src else "▧"
     handwriting_src = image_src(active_handwriting_path(memory))
@@ -1864,18 +2017,41 @@ elif page == "video":
         else '<div class="fake-player"><div class="fake-line"><span></span></div><div class="fake-controls">× ‹ ● › ↻</div></div>'
     )
     summary = escape(memory_summary_text(memory))
+    thumb_css = []
+    for index, item in enumerate(album_memories):
+        thumb_src = image_src(photo_path_for_memory(item))
+        is_selected = item.get("id") == memory.get("id")
+        border = "3px solid #fff" if is_selected else "1px solid rgba(255,255,255,.80)"
+        shadow = "0 0 0 2px rgba(0,0,0,.14)" if is_selected else "none"
+        background = f'background-image:url("{escape(thumb_src, quote=True)}");' if thumb_src else ""
+        thumb_css.append(
+            f"""
+.st-key-video_thumb_{index} button {{
+  width:100% !important;
+  height:56px !important;
+  min-height:56px !important;
+  padding:0 !important;
+  border:{border} !important;
+  border-radius:6px !important;
+  background-color:#d8d8d8 !important;
+  {background}
+  background-size:cover !important;
+  background-position:center !important;
+  box-shadow:{shadow} !important;
+}}
+.st-key-video_thumb_{index} button p {{ display:none !important; }}
+"""
+        )
+    thumb_css = "\n".join(thumb_css)
     html(f"""
 <style>
 .stApp {{ background:#efefef !important; }}
 .block-container {{ max-width:780px !important; min-height:500px !important; margin:18px auto 0 !important; padding:18px 32px 24px !important; background:#fffaf7 !important; overflow:hidden !important; }}
 header, [data-testid="stToolbar"], [data-testid="stDecoration"], #MainMenu, footer {{ display:none !important; }}
 .post-handle {{ width:24px; height:3px; border-radius:999px; background:#cfc7c2; margin:0 auto 22px; }}
-.video-grid {{ display:grid; grid-template-columns:1.48fr .58fr; gap:18px; align-items:start; }}
-.video-photo {{ border-radius:10px; background:#fff; box-shadow:0 10px 24px rgba(0,0,0,.08); padding:12px; min-height:392px; }}
+.video-photo {{ border-radius:10px; background:#fff; box-shadow:0 10px 24px rgba(0,0,0,.08); padding:12px; min-height:348px; }}
 .video-photo img {{ width:100%; height:315px; object-fit:contain; display:block; }}
-.thumb-row {{ display:grid; grid-template-columns:repeat(5, 1fr); gap:8px; margin-top:10px; }}
-.thumb {{ height:56px; border-radius:6px; background:#ddd; overflow:hidden; display:flex; align-items:center; justify-content:center; color:#777; }}
-.thumb img {{ width:100%; height:100%; object-fit:cover; }}
+.thumb-spacer {{ height:8px; }}
 .side-card {{ border-radius:10px; background:#fff; box-shadow:0 10px 24px rgba(0,0,0,.08); padding:12px; margin-bottom:10px; }}
 .side-card.note {{ min-height:132px; font-size:22px; text-align:center; }}
 .note-title {{ font-size:11px; font-weight:900; text-align:left; margin-bottom:8px; }}
@@ -1888,27 +2064,37 @@ header, [data-testid="stToolbar"], [data-testid="stDecoration"], #MainMenu, foot
 .fake-line {{ height:2px; background:rgba(0,0,0,.18); position:relative; margin-bottom:10px; }}
 .fake-line span {{ position:absolute; left:0; top:0; bottom:0; width:62%; background:#ef7d34; }}
 .fake-controls {{ display:flex; justify-content:center; gap:12px; align-items:center; font-size:13px; font-weight:900; }}
+{thumb_css}
 .st-key-video_prev_button button,
 .st-key-video_next_button button {{ height:46px !important; border-radius:999px !important; background:#fff !important; color:#111 !important; border:0 !important; box-shadow:0 8px 18px rgba(0,0,0,.10) !important; font-size:15px !important; font-weight:900 !important; }}
 </style>
 <div class="post-handle"></div>
-<div class="video-grid">
-  <div class="video-photo">
-    {photo}
-    <div class="thumb-row">
-      <div class="thumb">{photo}</div><div class="thumb">▧</div><div class="thumb">▧</div><div class="thumb">▧</div><div class="thumb">▧</div>
-    </div>
-  </div>
-  <div>
-    <div class="side-card song-card">
-      <div class="song-title">{escape(track.get("title") or "노래 제목")}</div>
-      <div style="font-size:11px; color:#777; margin-bottom:8px;">{escape(track.get("artist") or "가수")}</div>
-      {audio}
-    </div>
-    <div class="side-card note"><div class="note-title">손글씨 기록</div><div class="note-body">{handwriting}</div></div>
-    <div class="side-card" style="font-size:11px; line-height:1.5; background:#ffe4eb;"><b>AI 요약</b><br>{summary}</div>
-  </div>
+""")
+    video_left, video_right = st.columns([1.48, 0.58], gap="large")
+    with video_left:
+        html(f'<div class="video-photo">{photo}</div><div class="thumb-spacer"></div>')
+        for row_start in range(0, len(album_memories), 5):
+            row = album_memories[row_start:row_start + 5]
+            thumb_cols = st.columns(5, gap="small")
+            for offset, item in enumerate(row):
+                index = row_start + offset
+                with thumb_cols[offset]:
+                    st.button(
+                        " ",
+                        key=f"video_thumb_{index}",
+                        on_click=select_album_memory,
+                        args=(item.get("id"),),
+                        use_container_width=True,
+                    )
+    with video_right:
+        html(f"""
+<div class="side-card song-card">
+  <div class="song-title">{escape(track.get("title") or "노래 제목")}</div>
+  <div style="font-size:11px; color:#777; margin-bottom:8px;">{escape(track.get("artist") or "가수")}</div>
+  {audio}
 </div>
+<div class="side-card note"><div class="note-title">손글씨 기록</div><div class="note-body">{handwriting}</div></div>
+<div class="side-card" style="font-size:11px; line-height:1.5; background:#ffe4eb;"><b>AI 요약</b><br>{summary}</div>
 """)
     video_prev_col, video_gap_col, video_next_col = st.columns([0.28, 0.44, 0.28])
     with video_prev_col:
