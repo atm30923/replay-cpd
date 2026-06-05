@@ -31,6 +31,92 @@ OPENAI_TRANSCRIBE_MODEL = os.getenv("OPENAI_TRANSCRIBE_MODEL", "whisper-1")
 
 st.set_page_config(page_title="Re:Play", layout="centered", initial_sidebar_state="collapsed")
 
+
+def media_reference_available(path):
+    if not path:
+        return False
+    if str(path).startswith(("http://", "https://", "data:")):
+        return True
+    return os.path.exists(path)
+
+
+def local_photo_path_for(memory_id):
+    return os.path.join(PHOTO_DIR, f"{memory_id}.jpg")
+
+
+class MemoryStore:
+    """Storage boundary for memory metadata.
+
+    Local JSON is the default implementation. A Firebase implementation can
+    keep the same public methods while storing records in Realtime Database
+    and media references as Firebase Storage URLs.
+    """
+
+    def save(self, memory):
+        raise NotImplementedError
+
+    def load_all(self):
+        raise NotImplementedError
+
+    def delete(self, memory_id):
+        raise NotImplementedError
+
+    def record_path(self, memory_id):
+        return None
+
+
+class LocalMemoryStore(MemoryStore):
+    def __init__(self, memory_dir):
+        self.memory_dir = memory_dir
+
+    def record_path(self, memory_id):
+        return os.path.join(self.memory_dir, f"{memory_id}.json")
+
+    def save(self, memory):
+        memory_id = memory.get("id")
+        if not memory_id:
+            return
+        with open(self.record_path(memory_id), "w", encoding="utf-8") as file:
+            json.dump(memory, file, ensure_ascii=False, indent=2)
+
+    def load_all(self):
+        memories = []
+        for name in os.listdir(self.memory_dir):
+            if not name.endswith(".json"):
+                continue
+            path = os.path.join(self.memory_dir, name)
+            try:
+                with open(path, "r", encoding="utf-8") as file:
+                    memory = json.load(file)
+            except Exception:
+                continue
+            memory["id"] = memory.get("id") or os.path.splitext(name)[0]
+            memories.append(memory)
+        return memories
+
+    def delete(self, memory_id):
+        path = self.record_path(memory_id)
+        if os.path.exists(path):
+            os.remove(path)
+
+
+class FirebaseMemoryStore(MemoryStore):
+    def __init__(self):
+        raise NotImplementedError(
+            "Firebase storage is not configured yet. Implement this class with "
+            "Realtime Database records and Firebase Storage media URLs."
+        )
+
+
+def create_memory_store():
+    store_kind = os.getenv("MEMORY_STORE", "local").strip().lower()
+    if store_kind == "firebase":
+        return FirebaseMemoryStore()
+    return LocalMemoryStore(MEMORY_DIR)
+
+
+memory_store = create_memory_store()
+
 DEFAULTS = {
     "page": "splash",
     "photo_path": None,
@@ -49,6 +135,9 @@ DEFAULTS = {
     "handwriting_json": None,
     "write_mode": "chat",
     "analysis_done": False,
+    "analysis_label": "사진 속 순간",
+    "suggested_categories": [],
+    "music_query": "",
     "keywords": ["추억사진", "인물사진", "옛날 분위기"],
     "question": "이 사진을 찍던 날은 어떤 날이었나요?",
     "questions": [
@@ -61,6 +150,8 @@ DEFAULTS = {
     "home_tab": "album",
     "home_playing_memory_id": None,
     "editing_memory_id": None,
+    "edit_mode": "create",
+    "music_return_page": "home",
 }
 
 for key, value in DEFAULTS.items():
@@ -84,7 +175,10 @@ def set_previous_page():
     elif current == "write":
         st.session_state.page = "scan_done"
     elif current == "music":
-        st.session_state.page = "write"
+        if st.session_state.get("edit_mode") == "music_edit":
+            finish_existing_music_edit()
+        else:
+            st.session_state.page = "write"
     elif current in ("category_loading", "category_edit"):
         st.session_state.page = "music"
     elif current == "album_done":
@@ -124,6 +218,9 @@ def reset_flow():
     st.session_state.handwriting_json = None
     st.session_state.write_mode = "chat"
     st.session_state.analysis_done = False
+    st.session_state.analysis_label = "사진 속 순간"
+    st.session_state.suggested_categories = []
+    st.session_state.music_query = ""
     st.session_state.keywords = ["추억사진", "인물사진", "옛날 분위기"]
     st.session_state.question = "이 사진을 찍던 날은 어떤 날이었나요?"
     st.session_state.questions = [
@@ -134,6 +231,9 @@ def reset_flow():
     st.session_state.selected_category = ""
     st.session_state.selected_categories = []
     st.session_state.home_playing_memory_id = None
+    st.session_state.editing_memory_id = None
+    st.session_state.edit_mode = "create"
+    st.session_state.music_return_page = "home"
 
 
 def html(markup):
@@ -182,7 +282,11 @@ def image_to_base64(path):
 
 
 def image_src(path):
-    if not path or not os.path.exists(path):
+    if not path:
+        return ""
+    if str(path).startswith(("http://", "https://", "data:")):
+        return path
+    if not os.path.exists(path):
         return ""
     mime = "image/png" if path.lower().endswith(".png") else "image/jpeg"
     return f"data:{mime};base64,{image_to_base64(path)}"
@@ -190,7 +294,7 @@ def image_src(path):
 
 def save_photo(file):
     memory_id = str(uuid.uuid4())[:8]
-    path = os.path.join(PHOTO_DIR, f"{memory_id}.jpg")
+    path = local_photo_path_for(memory_id)
     image = Image.open(file).convert("RGB")
     image.save(path, quality=92)
     st.session_state.memory_id = memory_id
@@ -200,7 +304,7 @@ def save_photo(file):
 def restore_photo(memory_id):
     if not memory_id:
         return
-    path = os.path.join(PHOTO_DIR, f"{memory_id}.jpg")
+    path = local_photo_path_for(memory_id)
     if os.path.exists(path):
         st.session_state.memory_id = memory_id
         st.session_state.photo_path = path
@@ -311,25 +415,32 @@ def fallback_photo_analysis():
     ]
     return {
         "keywords": ["추억사진", "인물사진", "옛날 분위기"],
+        "analysis_label": "사진 속 순간",
         "question": questions[0],
         "questions": questions,
+        "categories": ["오래된 추억", "따뜻한 순간", "기억하고 싶은 날"],
+        "music_query": "korean nostalgic family ballad",
     }
 
 
 def analyze_photo_with_ai(path):
-    if not OPENAI_API_KEY or not path or not os.path.exists(path):
+    if not OPENAI_API_KEY or not path or not media_reference_available(path):
         return fallback_photo_analysis()
 
     prompt = """
-업로드된 사진을 보고 Re:Play 서비스에 쓸 짧은 한국어 키워드 3개와 회상 질문 3개를 만들어줘.
+업로드된 사진을 보고 Re:Play 서비스에 쓸 한국어 분석 정보를 만들어줘.
 
 규칙:
 - 사진에 실제로 보이는 단서만 기반으로 해.
-- 시대나 계절은 확실하지 않으면 단정하지 말고 "옛날 사진", "야외", "가족 모임"처럼 조심스럽게 표현해.
+- 시대, 연도, 계절은 확실하지 않으면 절대 단정하지 마.
 - 키워드는 각각 2~8글자 정도로 짧게.
+- scene_label은 화면 칩에 들어갈 짧은 상황 설명이야. 예: "생일을 축하하는 가족", "바닷가 여행", "교복 입은 친구들".
 - 질문은 사진 속 인물, 장소, 상황, 분위기 같은 시각 단서에 맞춰 서로 다르게 만들어.
 - 질문은 사용자가 사진 속 기억을 떠올릴 수 있는 자연스러운 한 문장.
-- 반드시 JSON만 반환해. 형식: {"keywords":["키워드1","키워드2","키워드3"],"questions":["질문1","질문2","질문3"]}
+- categories는 이 사진이 들어갈 앨범/플레이리스트 이름 후보 3~5개야. 사진 속 상황에 맞게 구체적으로 만들어.
+- music_query는 Spotify 검색에 쓸 짧은 검색어야. 사진 분위기와 상황에 맞는 장르/무드/상황을 섞어줘. 매번 "memories"처럼 똑같은 말만 쓰지 마.
+- 반드시 JSON만 반환해. 형식:
+{"keywords":["키워드1","키워드2","키워드3"],"scene_label":"짧은상황설명","questions":["질문1","질문2","질문3"],"categories":["카테고리1","카테고리2","카테고리3"],"music_query":"spotify search query"}
 """
     body = {
         "model": OPENAI_VISION_MODEL,
@@ -343,7 +454,7 @@ def analyze_photo_with_ai(path):
                 ],
             }
         ],
-        "max_tokens": 420,
+        "max_tokens": 650,
         "temperature": 0.2,
     }
     try:
@@ -359,14 +470,31 @@ def analyze_photo_with_ai(path):
         response.raise_for_status()
         content = response.json()["choices"][0]["message"]["content"]
         data = json.loads(content)
+        fallback = fallback_photo_analysis()
         keywords = [str(item).strip() for item in data.get("keywords", []) if str(item).strip()]
         raw_questions = data.get("questions") or [data.get("question", "")]
         questions = [str(item).strip() for item in raw_questions if str(item).strip()]
+        categories = [str(item).strip() for item in data.get("categories", []) if str(item).strip()]
+        analysis_label = str(data.get("scene_label") or data.get("analysis_label") or "").strip()
+        music_query = str(data.get("music_query") or "").strip()
         if len(keywords) < 3 or not questions:
             return fallback_photo_analysis()
         if len(questions) < 3:
-            questions = (questions + fallback_photo_analysis()["questions"])[:3]
-        return {"keywords": keywords[:3], "question": questions[0], "questions": questions[:3]}
+            questions = (questions + fallback["questions"])[:3]
+        if not analysis_label:
+            analysis_label = keywords[0] if keywords else fallback["analysis_label"]
+        if not categories:
+            categories = fallback["categories"]
+        if not music_query:
+            music_query = " ".join(categories[:2] + keywords[:2]) or fallback["music_query"]
+        return {
+            "keywords": keywords[:3],
+            "analysis_label": analysis_label[:28],
+            "question": questions[0],
+            "questions": questions[:3],
+            "categories": categories[:5],
+            "music_query": music_query,
+        }
     except Exception:
         return fallback_photo_analysis()
 
@@ -397,14 +525,89 @@ def update_photo_analysis():
         return
     result = analyze_photo_with_ai(st.session_state.photo_path)
     st.session_state.keywords = result["keywords"]
+    st.session_state.analysis_label = result.get("analysis_label", "사진 속 순간")
     st.session_state.question = result["question"]
     st.session_state.questions = result["questions"]
+    st.session_state.suggested_categories = result.get("categories", [])
+    st.session_state.music_query = result.get("music_query", "")
     st.session_state.selected_category = ""
     st.session_state.selected_categories = []
     st.session_state.analysis_done = True
 
 
-def save_memory():
+def fallback_memory_summary(memory=None):
+    memory = memory or {}
+    keywords = memory.get("keywords") or st.session_state.get("keywords", [])
+    questions = memory.get("questions") or st.session_state.get("questions", [])
+    category = memory.get("category") or st.session_state.get("selected_category", "추억")
+    analysis_label = memory.get("analysis_label") or st.session_state.get("analysis_label") or category
+    note = " ".join(str(memory.get("note") or st.session_state.get("memory_text", "")).split())
+    lead = ", ".join(keywords[:2]) if keywords else category
+    prompt = questions[0] if questions else st.session_state.get("question", "")
+
+    if note:
+        note_preview = note if len(note) <= 54 else f"{note[:54]}..."
+        return f"{analysis_label} 속에 '{note_preview}'라는 기억이 담겨 있어요. {lead}의 분위기가 함께 느껴져요."
+    return f"{analysis_label} 장면이에요. {lead}의 단서가 보여요. {prompt}"
+
+
+def summarize_memory_with_ai(memory):
+    fallback = fallback_memory_summary(memory)
+    if not OPENAI_API_KEY:
+        return fallback
+
+    note = str(memory.get("note") or "").strip()
+    keywords = ", ".join(memory.get("keywords") or [])
+    questions = " / ".join(memory.get("questions") or [])
+    categories = ", ".join(memory_categories(memory))
+    prompt = f"""
+사진과 사용자가 직접 기록한 글을 함께 보고 Re:Play 앨범의 AI 요약을 한국어로 작성해줘.
+
+사진 AI 분석:
+- 장면: {memory.get("analysis_label") or ""}
+- 키워드: {keywords}
+- 회상 질문: {questions}
+- 카테고리: {categories}
+
+사용자 기록:
+{note or "아직 직접 기록한 문장은 없음"}
+
+규칙:
+- 사용자가 적은 기록을 가장 중요하게 반영해.
+- 사진에 보이지 않는 사실은 단정하지 마.
+- 따뜻하지만 과장하지 말고, 앨범 카드에 들어갈 1~2문장으로 써.
+- 120자 안팎으로 짧게.
+- 요약 문장만 반환해.
+"""
+    content = [{"type": "text", "text": prompt}]
+    photo = memory.get("photo")
+    if media_reference_available(photo):
+        content.append({"type": "image_url", "image_url": {"url": image_src(photo)}})
+
+    body = {
+        "model": OPENAI_VISION_MODEL,
+        "messages": [{"role": "user", "content": content}],
+        "max_tokens": 180,
+        "temperature": 0.35,
+    }
+    try:
+        response = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json=body,
+            timeout=20,
+        )
+        response.raise_for_status()
+        summary = response.json()["choices"][0]["message"]["content"].strip()
+        return summary or fallback
+    except Exception:
+        return fallback
+
+
+def save_memory(include_summary=True):
     if not st.session_state.memory_id:
         st.session_state.memory_id = str(uuid.uuid4())[:8]
     handwriting = st.session_state.handwriting_path or handwriting_path_for(st.session_state.memory_id)
@@ -412,8 +615,11 @@ def save_memory():
         "id": st.session_state.memory_id,
         "photo": st.session_state.photo_path,
         "keywords": st.session_state.keywords,
+        "analysis_label": st.session_state.analysis_label,
         "question": st.session_state.question,
         "questions": st.session_state.questions,
+        "suggested_categories": st.session_state.suggested_categories,
+        "music_query": st.session_state.music_query,
         "note": st.session_state.memory_text,
         "handwriting": handwriting,
         "selected_track": st.session_state.selected_track,
@@ -421,28 +627,31 @@ def save_memory():
         "categories": ensure_selected_categories(),
         "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
-    with open(os.path.join(MEMORY_DIR, f"{data['id']}.json"), "w", encoding="utf-8") as file:
-        json.dump(data, file, ensure_ascii=False, indent=2)
+    existing_summary = (st.session_state.get("play_memory") or {}).get("summary")
+    if include_summary:
+        data["summary"] = summarize_memory_with_ai(data)
+    elif existing_summary:
+        data["summary"] = existing_summary
+    memory_store.save(data)
     st.session_state.play_memory = data
     st.session_state.selected_memory_id = data["id"]
 
 
 def load_memories():
     memories = []
-    for name in os.listdir(MEMORY_DIR):
-        if not name.endswith(".json"):
+    for memory in memory_store.load_all():
+        memory_id = memory.get("id")
+        if not memory_id:
             continue
-        try:
-            with open(os.path.join(MEMORY_DIR, name), "r", encoding="utf-8") as file:
-                memory = json.load(file)
-        except Exception:
-            continue
-        memory_id = memory.get("id") or os.path.splitext(name)[0]
         memory["id"] = memory_id
         handwriting = memory.get("handwriting") or handwriting_path_for(memory_id)
         if handwriting:
             memory["handwriting"] = handwriting
-        if memory.get("photo") and os.path.exists(memory["photo"]):
+        if not media_reference_available(memory.get("photo")):
+            local_photo = local_photo_path_for(memory_id)
+            if os.path.exists(local_photo):
+                memory["photo"] = local_photo
+        if media_reference_available(memory.get("photo")):
             memories.append(memory)
     memories.sort(key=lambda item: item.get("time", ""), reverse=True)
     return memories
@@ -488,15 +697,14 @@ def memory_note_preview(memory, limit=32):
 
 
 def memory_json_path(memory_id):
-    return os.path.join(MEMORY_DIR, f"{memory_id}.json")
+    return memory_store.record_path(memory_id)
 
 
 def save_memory_record(memory):
     memory_id = memory.get("id")
     if not memory_id:
         return
-    with open(memory_json_path(memory_id), "w", encoding="utf-8") as file:
-        json.dump(memory, file, ensure_ascii=False, indent=2)
+    memory_store.save(memory)
 
 
 def parse_category_text(text):
@@ -612,22 +820,60 @@ def open_memory_edit(memory_id):
         return
     select_album_memory(memory_id)
     st.session_state.editing_memory_id = memory_id
+    st.session_state.edit_mode = "memory_edit"
     st.session_state.page = "memory_edit"
 
 
+def load_memory_record(memory_id):
+    if not memory_id:
+        return None
+    return next((memory for memory in load_memories() if memory.get("id") == memory_id), None)
+
+
 def open_music_edit(memory_id):
-    picked = next((memory for memory in load_memories() if memory.get("id") == memory_id), None)
+    picked = load_memory_record(memory_id)
     if not picked:
         reset_flow()
         st.session_state.page = "music"
         return
     select_album_memory(memory_id)
+    st.session_state.editing_memory_id = memory_id
+    st.session_state.edit_mode = "music_edit"
+    st.session_state.music_return_page = st.session_state.get("page") or "home"
     st.session_state.selected_track = picked.get("selected_track")
     st.session_state.page = "music"
 
 
+def update_memory_track(memory_id, track):
+    picked = load_memory_record(memory_id)
+    if not picked:
+        return False
+    picked["selected_track"] = track
+    save_memory_record(picked)
+    st.session_state.play_memory = picked
+    st.session_state.selected_memory_id = memory_id
+    st.session_state.memory_id = memory_id
+    st.session_state.selected_track = track
+    return True
+
+
+def finish_existing_music_edit():
+    st.session_state.editing_memory_id = None
+    st.session_state.edit_mode = "create"
+    st.session_state.music_show_more = False
+    st.session_state.home_tab = "music"
+    st.session_state.page = "home"
+
+
+def is_existing_edit_flow():
+    return bool(st.session_state.get("editing_memory_id")) and st.session_state.get("edit_mode") in (
+        "memory_edit",
+        "music_edit",
+    )
+
+
 def clear_memory_track(memory_id):
-    picked = next((memory for memory in load_memories() if memory.get("id") == memory_id), None)
+    picked = load_memory_record(memory_id)
     if not picked:
         return
     picked["selected_track"] = None
@@ -674,9 +920,9 @@ def photo_path_for_memory(memory):
     candidates = [memory.get("photo")]
     memory_id = memory.get("id")
     if memory_id:
-        candidates.append(os.path.join(PHOTO_DIR, f"{memory_id}.jpg"))
+        candidates.append(local_photo_path_for(memory_id))
     for path in candidates:
-        if path and os.path.exists(path):
+        if media_reference_available(path):
             return path
     return None
 
@@ -692,6 +938,9 @@ def select_album_memory(memory_id):
     st.session_state.photo_path = photo_path_for_memory(picked)
     st.session_state.memory_text = picked.get("note", st.session_state.get("memory_text", ""))
     st.session_state.handwriting_path = picked.get("handwriting") or handwriting_path_for(memory_id)
+    st.session_state.analysis_label = picked.get("analysis_label") or st.session_state.get("analysis_label", "사진 속 순간")
+    st.session_state.suggested_categories = picked.get("suggested_categories") or picked.get("categories") or []
+    st.session_state.music_query = picked.get("music_query") or st.session_state.get("music_query", "")
     st.session_state.selected_categories = memory_categories(picked)
     st.session_state.selected_category = ", ".join(st.session_state.selected_categories)
     if not st.session_state.get("album_category") and st.session_state.selected_categories:
@@ -723,19 +972,25 @@ def active_memory():
                 st.session_state.play_memory = item
                 st.session_state.selected_memory_id = memory_id
                 st.session_state.memory_text = item.get("note", st.session_state.get("memory_text", ""))
+                st.session_state.analysis_label = item.get("analysis_label") or st.session_state.get("analysis_label", "사진 속 순간")
+                st.session_state.suggested_categories = item.get("suggested_categories") or item.get("categories") or []
+                st.session_state.music_query = item.get("music_query") or st.session_state.get("music_query", "")
                 st.session_state.selected_category = item.get("category") or st.session_state.get("selected_category", "")
                 st.session_state.selected_categories = item.get("categories") or ([st.session_state.selected_category] if st.session_state.selected_category else [])
                 handwriting = item.get("handwriting") or handwriting_path_for(memory_id)
                 if handwriting:
                     st.session_state.handwriting_path = handwriting
                 return item
-    if (not memory.get("photo") or not os.path.exists(memory.get("photo", ""))) and all_memories:
+    if (not memory.get("photo") or not media_reference_available(memory.get("photo"))) and all_memories:
         item = all_memories[0]
         st.session_state.play_memory = item
         st.session_state.selected_memory_id = item.get("id")
         st.session_state.memory_id = item.get("id") or st.session_state.get("memory_id")
         st.session_state.photo_path = item.get("photo") or st.session_state.get("photo_path")
         st.session_state.memory_text = item.get("note", st.session_state.get("memory_text", ""))
+        st.session_state.analysis_label = item.get("analysis_label") or st.session_state.get("analysis_label", "사진 속 순간")
+        st.session_state.suggested_categories = item.get("suggested_categories") or item.get("categories") or []
+        st.session_state.music_query = item.get("music_query") or st.session_state.get("music_query", "")
         st.session_state.selected_category = item.get("category") or st.session_state.get("selected_category", "")
         st.session_state.selected_categories = item.get("categories") or ([st.session_state.selected_category] if st.session_state.selected_category else [])
         handwriting = item.get("handwriting") or handwriting_path_for(item.get("id"))
@@ -753,9 +1008,9 @@ def active_photo_path(memory=None):
     ]
     for memory_id in (memory.get("id"), st.session_state.get("memory_id"), st.session_state.get("selected_memory_id")):
         if memory_id:
-            candidates.append(os.path.join(PHOTO_DIR, f"{memory_id}.jpg"))
+            candidates.append(local_photo_path_for(memory_id))
     for path in candidates:
-        if path and os.path.exists(path):
+        if media_reference_available(path):
             st.session_state.photo_path = path
             return path
     return None
@@ -771,7 +1026,7 @@ def active_handwriting_path(memory=None):
         handwriting_path_for(st.session_state.get("selected_memory_id")),
     ]
     for path in candidates:
-        if path and os.path.exists(path):
+        if media_reference_available(path):
             st.session_state.handwriting_path = path
             return path
     return None
@@ -780,9 +1035,9 @@ def active_handwriting_path(memory=None):
 def delete_memory(memory_id):
     if not memory_id:
         return
+    memory_store.delete(memory_id)
     paths = [
-        os.path.join(MEMORY_DIR, f"{memory_id}.json"),
-        os.path.join(PHOTO_DIR, f"{memory_id}.jpg"),
+        local_photo_path_for(memory_id),
         os.path.join(HANDWRITING_DIR, f"{memory_id}.png"),
     ]
     for path in paths:
@@ -808,12 +1063,35 @@ def get_spotify_token():
 
 
 def spotify_recommendations(query="korean old pop memories"):
-    fallback = [
-        {"title": "Love Smile Peace", "artist": "Memory Tape", "image": "", "preview_url": ""},
-        {"title": "Don't Worry", "artist": "Vintage Radio", "image": "", "preview_url": ""},
-        {"title": "봄날의 기억", "artist": "Re:Play", "image": "", "preview_url": ""},
-        {"title": "Last Scene", "artist": "Soft Vinyl", "image": "", "preview_url": ""},
-    ]
+    query_text = str(query or "").lower()
+    if any(word in query_text for word in ("birthday", "생일", "party", "축하", "cake")):
+        fallback = [
+            {"title": "Happy Birthday To You", "artist": "Birthday Memory", "image": "", "preview_url": ""},
+            {"title": "Celebration", "artist": "Family Day", "image": "", "preview_url": ""},
+            {"title": "Sweet Cake", "artist": "Re:Play", "image": "", "preview_url": ""},
+            {"title": "우리의 생일", "artist": "Warm Vinyl", "image": "", "preview_url": ""},
+        ]
+    elif any(word in query_text for word in ("travel", "trip", "beach", "sea", "여행", "바다", "여름")):
+        fallback = [
+            {"title": "Summer Trip", "artist": "Memory Road", "image": "", "preview_url": ""},
+            {"title": "바람 부는 날", "artist": "Re:Play", "image": "", "preview_url": ""},
+            {"title": "Ocean Drive", "artist": "Soft Vinyl", "image": "", "preview_url": ""},
+            {"title": "첫 여행", "artist": "Family Tape", "image": "", "preview_url": ""},
+        ]
+    elif any(word in query_text for word in ("school", "graduation", "friend", "학교", "졸업", "친구")):
+        fallback = [
+            {"title": "Graduation Day", "artist": "Youth Radio", "image": "", "preview_url": ""},
+            {"title": "친구와 함께", "artist": "Re:Play", "image": "", "preview_url": ""},
+            {"title": "Old Class", "artist": "Memory Tape", "image": "", "preview_url": ""},
+            {"title": "Young Again", "artist": "Soft Vinyl", "image": "", "preview_url": ""},
+        ]
+    else:
+        fallback = [
+            {"title": "Family Warmth", "artist": "Memory Tape", "image": "", "preview_url": ""},
+            {"title": "오래된 사진", "artist": "Re:Play", "image": "", "preview_url": ""},
+            {"title": "Warm Ballad", "artist": "Vintage Radio", "image": "", "preview_url": ""},
+            {"title": "Last Scene", "artist": "Soft Vinyl", "image": "", "preview_url": ""},
+        ]
     try:
         token = get_spotify_token()
         if not token:
@@ -841,11 +1119,47 @@ def spotify_recommendations(query="korean old pop memories"):
         return fallback
 
 
+def photo_music_query(memory=None):
+    memory = memory or {}
+    explicit_query = str(memory.get("music_query") or st.session_state.get("music_query") or "").strip()
+    if explicit_query:
+        return explicit_query
+
+    categories = (
+        memory.get("suggested_categories")
+        or memory_categories(memory)
+        or st.session_state.get("suggested_categories")
+        or st.session_state.get("selected_categories")
+        or []
+    )
+    keywords = memory.get("keywords") or st.session_state.get("keywords", [])
+    label = str(memory.get("analysis_label") or st.session_state.get("analysis_label") or "").strip()
+    scene_text = " ".join([label] + [str(item) for item in categories + keywords])
+
+    if any(word in scene_text for word in ("생일", "파티", "축하", "케이크")):
+        return "birthday family korean cheerful pop"
+    if any(word in scene_text for word in ("여행", "바다", "여름", "휴가", "나들이")):
+        return "travel summer korean acoustic pop"
+    if any(word in scene_text for word in ("학교", "졸업", "친구", "교복")):
+        return "graduation friendship korean pop"
+    if any(word in scene_text for word in ("결혼", "예식", "약속")):
+        return "wedding korean romantic ballad"
+    if any(word in scene_text for word in ("가족", "부모", "아이", "아기")):
+        return "family warm korean ballad"
+    if scene_text.strip():
+        return f"{scene_text} korean nostalgic song"
+    return "korean nostalgic family ballad"
+
+
 def category_candidates():
     keywords = [word for word in st.session_state.get("keywords", []) if word]
     question_text = " ".join(st.session_state.get("questions", []))
     scene_text = " ".join(keywords + [question_text])
     labels = []
+    for label in st.session_state.get("suggested_categories", []) or []:
+        cleaned_label = str(label).strip()
+        if cleaned_label:
+            labels.append(cleaned_label)
     rules = [
         (("가족", "부모", "형제", "자매"), "가족의 추억"),
         (("여름", "바다", "휴가", "물놀이"), "우리의 여름"),
@@ -874,12 +1188,10 @@ def category_candidates():
 
 def memory_summary_text(memory=None):
     memory = memory or {}
-    keywords = memory.get("keywords") or st.session_state.get("keywords", [])
-    questions = memory.get("questions") or st.session_state.get("questions", [])
-    category = memory.get("category") or st.session_state.get("selected_category", "추억")
-    lead = ", ".join(keywords[:2]) if keywords else category
-    prompt = questions[0] if questions else st.session_state.get("question", "")
-    return f"{category} 분위기가 담긴 사진이에요. {lead}의 단서가 보여요. {prompt}"
+    summary = str(memory.get("summary") or "").strip()
+    if summary:
+        return summary
+    return fallback_memory_summary(memory)
 
 
 def tile_html(memory=None, selected=False):
@@ -908,6 +1220,8 @@ if memory_id:
     restore_photo(memory_id)
 if action:
     if action == "home":
+        st.session_state.editing_memory_id = None
+        st.session_state.edit_mode = "create"
         st.session_state.page = "home"
     elif action == "family_home":
         st.session_state.page = "family_home"
@@ -936,8 +1250,11 @@ if action:
             st.session_state.memory_text = picked.get("note", "")
             st.session_state.handwriting_path = picked.get("handwriting") or handwriting_path_for(memory_id)
             st.session_state.keywords = picked.get("keywords") or st.session_state.keywords
+            st.session_state.analysis_label = picked.get("analysis_label") or st.session_state.get("analysis_label", "사진 속 순간")
             st.session_state.question = picked.get("question") or st.session_state.question
             st.session_state.questions = picked.get("questions") or [st.session_state.question]
+            st.session_state.suggested_categories = picked.get("suggested_categories") or picked.get("categories") or []
+            st.session_state.music_query = picked.get("music_query") or st.session_state.get("music_query", "")
             st.session_state.selected_category = picked.get("category") or st.session_state.selected_category
             st.session_state.selected_categories = picked.get("categories") or ([st.session_state.selected_category] if st.session_state.selected_category else [])
             categories = memory_categories(picked)
@@ -963,12 +1280,18 @@ if action:
             st.session_state.play_memory = picked
             st.session_state.selected_category = picked.get("category") or st.session_state.selected_category
             st.session_state.selected_categories = picked.get("categories") or ([st.session_state.selected_category] if st.session_state.selected_category else [])
+            st.session_state.analysis_label = picked.get("analysis_label") or st.session_state.get("analysis_label", "사진 속 순간")
+            st.session_state.suggested_categories = picked.get("suggested_categories") or picked.get("categories") or []
+            st.session_state.music_query = picked.get("music_query") or st.session_state.get("music_query", "")
             categories = memory_categories(picked)
             open_category_album(categories[0] if categories else st.session_state.selected_category, picked.get("id"))
         elif memories:
             st.session_state.play_memory = memories[0]
             st.session_state.selected_category = memories[0].get("category") or st.session_state.selected_category
             st.session_state.selected_categories = memories[0].get("categories") or ([st.session_state.selected_category] if st.session_state.selected_category else [])
+            st.session_state.analysis_label = memories[0].get("analysis_label") or st.session_state.get("analysis_label", "사진 속 순간")
+            st.session_state.suggested_categories = memories[0].get("suggested_categories") or memories[0].get("categories") or []
+            st.session_state.music_query = memories[0].get("music_query") or st.session_state.get("music_query", "")
             categories = memory_categories(memories[0])
             open_category_album(categories[0] if categories else st.session_state.selected_category, memories[0].get("id"))
         else:
@@ -981,13 +1304,22 @@ if action:
             st.session_state.write_mode = mode
         st.session_state.page = "write"
     elif action == "music":
+        if st.session_state.get("edit_mode") != "music_edit":
+            st.session_state.editing_memory_id = None
+            st.session_state.edit_mode = "create"
         if note_text is not None:
             st.session_state.memory_text = note_text
         st.session_state.page = "music"
     elif action == "category_loading":
-        st.session_state.page = "category_loading"
+        if is_existing_edit_flow():
+            finish_existing_music_edit()
+        else:
+            st.session_state.page = "category_loading"
     elif action == "category_edit":
-        st.session_state.page = "category_edit"
+        if is_existing_edit_flow():
+            finish_existing_music_edit()
+        else:
+            st.session_state.page = "category_edit"
     elif action == "category_pick":
         picked_category = st.query_params.get("category")
         if picked_category:
@@ -995,13 +1327,25 @@ if action:
             st.session_state.selected_category = picked_category
             st.session_state.category_direct_text = picked_category
             st.session_state.category_direct_input = picked_category
-        st.session_state.page = "category_edit"
+        if is_existing_edit_flow():
+            finish_existing_music_edit()
+        else:
+            st.session_state.page = "category_edit"
     elif action == "album_done":
-        st.session_state.page = "album_done"
+        if is_existing_edit_flow():
+            finish_existing_music_edit()
+        else:
+            st.session_state.page = "album_done"
     elif action == "nfc_scan":
-        st.session_state.page = "nfc_scan"
+        if is_existing_edit_flow():
+            finish_existing_music_edit()
+        else:
+            st.session_state.page = "nfc_scan"
     elif action == "nfc_done":
-        st.session_state.page = "nfc_done"
+        if is_existing_edit_flow():
+            finish_existing_music_edit()
+        else:
+            st.session_state.page = "nfc_done"
     elif action == "video":
         open_category_album(album_category_from_state(st.session_state.get("play_memory") or {}), st.session_state.get("selected_memory_id"))
     elif action == "player":
@@ -1181,6 +1525,158 @@ iframe[title*="streamlit_drawable_canvas"] { display:block; border-radius:14px; 
 .music-page-shell [data-testid="stVerticalBlock"] { gap:.35rem !important; }
 @media (max-width:820px) { .music-page-shell { padding:24px 24px 32px; } }
 
+</style>
+""")
+
+html("""
+<style>
+:root {
+    --ipad-shell-width: 1180px;
+    --ipad-shell-margin: 16px;
+    --ipad-shell-height: calc(100dvh - (var(--ipad-shell-margin) * 2));
+    --ipad-shell-radius: 28px;
+}
+html,
+body,
+.stApp {
+    min-height:100dvh !important;
+    overflow:auto !important;
+}
+.stApp .block-container {
+    width:min(var(--ipad-shell-width), calc(100vw - (var(--ipad-shell-margin) * 2))) !important;
+    max-width:min(var(--ipad-shell-width), calc(100vw - (var(--ipad-shell-margin) * 2))) !important;
+    min-height:min(760px, var(--ipad-shell-height)) !important;
+    max-height:var(--ipad-shell-height) !important;
+    margin:var(--ipad-shell-margin) auto !important;
+    padding:clamp(18px, 2.6vw, 34px) clamp(18px, 3.4vw, 42px) 76px !important;
+    border-radius:var(--ipad-shell-radius) !important;
+    overflow-x:hidden !important;
+    overflow-y:auto !important;
+    position:relative !important;
+    -webkit-overflow-scrolling:touch;
+}
+.stApp .block-container::-webkit-scrollbar {
+    width:0;
+    height:0;
+}
+.stApp .app-card,
+.stApp .home,
+.stApp .flow,
+.stApp .write-screen,
+.stApp .native-music-wrap,
+.stApp .music-page-shell {
+    width:100% !important;
+    max-width:100% !important;
+    min-height:calc(var(--ipad-shell-height) - 68px) !important;
+    height:auto !important;
+    overflow:visible !important;
+}
+.stApp .splash {
+    height:auto !important;
+    min-height:calc(var(--ipad-shell-height) - 68px) !important;
+}
+.stApp .flow,
+.stApp .home {
+    padding:clamp(22px, 3vw, 38px) clamp(24px, 4vw, 48px) 76px !important;
+}
+.stApp .home-content,
+.stApp .home-footer-actions {
+    max-width:100% !important;
+}
+.stApp .home-track-list,
+.stApp .playlist {
+    max-height:clamp(240px, 42dvh, 360px) !important;
+    overflow-y:auto !important;
+}
+.stApp .record-photo-card {
+    height:clamp(220px, 35dvh, 320px) !important;
+}
+.stApp .pad-card {
+    height:auto !important;
+    min-height:clamp(300px, 52dvh, 420px) !important;
+}
+.stApp div[data-testid="stCustomComponentV1"]:has(iframe[title*="streamlit_drawable_canvas"]),
+.stApp .element-container:has(iframe[title*="streamlit_drawable_canvas"]) {
+    height:clamp(320px, 54dvh, 430px) !important;
+    max-height:clamp(320px, 54dvh, 430px) !important;
+}
+.stApp iframe[title*="streamlit_drawable_canvas"] {
+    height:clamp(320px, 54dvh, 430px) !important;
+}
+.stApp .music-photo-box {
+    height:clamp(150px, 26dvh, 220px) !important;
+}
+.stApp .music-turntable {
+    height:clamp(170px, 31dvh, 250px) !important;
+}
+.stApp .video-photo {
+    min-height:clamp(290px, 50dvh, 430px) !important;
+}
+.stApp .video-photo img {
+    height:clamp(260px, 46dvh, 400px) !important;
+}
+.stApp .album-photo img,
+.stApp .album-note {
+    height:clamp(120px, 24dvh, 170px) !important;
+}
+.stApp .family-shell {
+    width:100% !important;
+    max-width:760px !important;
+    margin:0 auto !important;
+    padding-bottom:72px !important;
+}
+.stApp .family-bottom-nav {
+    bottom:0 !important;
+}
+@supports (height: 100svh) {
+    :root {
+        --ipad-shell-height: calc(100svh - (var(--ipad-shell-margin) * 2));
+    }
+}
+@media (max-width: 900px) {
+    :root {
+        --ipad-shell-margin: 10px;
+        --ipad-shell-radius: 22px;
+    }
+    .stApp .block-container {
+        padding:22px 22px 72px !important;
+    }
+    .stApp .home-title-zone,
+    .stApp .home-content {
+        margin-left:0 !important;
+        width:100% !important;
+    }
+    .stApp .home-footer-actions {
+        margin-left:0 !important;
+        margin-right:0 !important;
+        gap:24px !important;
+    }
+}
+@media (max-width: 640px) {
+    :root {
+        --ipad-shell-margin: 0px;
+        --ipad-shell-radius: 0px;
+    }
+    .stApp .block-container {
+        width:100vw !important;
+        max-width:100vw !important;
+        min-height:100dvh !important;
+        max-height:none !important;
+        margin:0 !important;
+        padding:18px 16px 72px !important;
+        border-radius:0 !important;
+    }
+    .stApp .app-card,
+    .stApp .home,
+    .stApp .flow,
+    .stApp .music-page-shell,
+    .stApp .native-music-wrap {
+        min-height:auto !important;
+    }
+    .stApp .home-footer-actions {
+        grid-template-columns:1fr !important;
+    }
+}
 </style>
 """)
 
@@ -2500,23 +2996,28 @@ elif page == "memory_edit":
 <style>
 .stApp { background:#efefef !important; }
 .block-container {
-    max-width:820px !important;
+    max-width:900px !important;
     min-height:560px !important;
     margin:20px auto 0 !important;
-    padding:34px 46px !important;
+    padding:34px 46px 76px !important;
     background:radial-gradient(circle at 84% 0%, rgba(255,119,54,.20), transparent 32%), #fffaf7 !important;
-    overflow:hidden !important;
+    overflow:visible !important;
 }
 header, [data-testid="stToolbar"], [data-testid="stDecoration"], #MainMenu, footer { display:none !important; }
-.edit-head { display:flex; align-items:center; justify-content:space-between; margin-bottom:22px; }
+.edit-head { max-width:720px; margin:0 auto 22px; display:flex; align-items:center; justify-content:space-between; }
 .edit-title { font-size:26px; font-weight:1000; }
-.edit-layout { display:grid; grid-template-columns:270px 1fr; gap:28px; align-items:start; }
-.edit-photo { height:220px; border-radius:16px; background:#eee; display:flex; align-items:center; justify-content:center; overflow:hidden; box-shadow:0 12px 24px rgba(0,0,0,.07); }
+.edit-layout { max-width:720px; margin:0 auto 18px; }
+.edit-photo { width:360px; max-width:100%; height:230px; border-radius:16px; background:#eee; display:flex; align-items:center; justify-content:center; overflow:hidden; box-shadow:0 12px 24px rgba(0,0,0,.07); }
 .edit-photo img { width:100%; height:100%; object-fit:cover; display:block; }
-.edit-hint { margin-top:14px; color:#777; font-size:12px; line-height:1.5; }
-.edit-form-card { border-radius:18px; background:#fff; box-shadow:0 14px 32px rgba(0,0,0,.08); padding:18px; }
-.edit-form-card label { font-size:13px !important; font-weight:900 !important; color:#111 !important; }
-.edit-form-card input, .edit-form-card textarea { border:0 !important; border-radius:12px !important; background:#f5f6f7 !important; box-shadow:none !important; font-size:15px !important; }
+.edit-hint { width:360px; max-width:100%; margin-top:14px; color:#777; font-size:12px; line-height:1.5; }
+div[data-testid="stTextInput"],
+div[data-testid="stTextArea"] { max-width:720px; margin-left:auto !important; margin-right:auto !important; }
+div[data-testid="stTextInput"] label,
+div[data-testid="stTextArea"] label { font-size:13px !important; font-weight:900 !important; color:#111 !important; }
+div[data-testid="stTextInput"] input,
+div[data-testid="stTextArea"] textarea { border:0 !important; border-radius:12px !important; background:#f5f6f7 !important; box-shadow:none !important; font-size:15px !important; }
+div[data-testid="stTextInput"] input { height:48px !important; }
+div[data-testid="stTextArea"] textarea { min-height:140px !important; resize:none !important; }
 .st-key-edit_save_button button { background:#111 !important; color:#fff !important; height:48px !important; border-radius:999px !important; }
 .st-key-edit_delete_button button { background:#fff !important; color:#d94a35 !important; height:48px !important; border-radius:999px !important; border:1px solid rgba(217,74,53,.24) !important; }
 </style>
@@ -2528,7 +3029,7 @@ header, [data-testid="stToolbar"], [data-testid="stDecoration"], #MainMenu, foot
     <div class="edit-photo">{photo_html}</div>
     <div class="edit-hint">사진은 그대로 두고 제목, 기록, 카테고리만 수정할 수 있어요.</div>
   </div>
-  <div class="edit-form-card">
+</div>
 """)
     title_value = st.text_input("제목", value=str(edit_memory.get("title") or ""), key=f"edit_title_{edit_id}")
     note_value = st.text_area("기록 내용", value=str(edit_memory.get("note") or ""), key=f"edit_note_{edit_id}", height=140)
@@ -2538,7 +3039,7 @@ header, [data-testid="stToolbar"], [data-testid="stDecoration"], #MainMenu, foot
         key=f"edit_category_{edit_id}",
         help="여러 개면 쉼표로 나눠 적어주세요.",
     )
-    html("</div></div>")
+    html("")
     save_col, delete_col = st.columns(2)
     with save_col:
         if st.button("저장하기", key="edit_save_button", use_container_width=True):
@@ -2547,15 +3048,19 @@ header, [data-testid="stToolbar"], [data-testid="stDecoration"], #MainMenu, foot
             edit_memory["note"] = note_value
             edit_memory["categories"] = categories
             edit_memory["category"] = ", ".join(categories)
+            edit_memory["summary"] = summarize_memory_with_ai(edit_memory)
             save_memory_record(edit_memory)
             st.session_state.play_memory = edit_memory
             st.session_state.selected_memory_id = edit_id
+            st.session_state.editing_memory_id = None
+            st.session_state.edit_mode = "create"
             st.session_state.page = "home"
             st.rerun()
     with delete_col:
         if st.button("삭제하기", key="edit_delete_button", use_container_width=True):
             delete_memory(edit_id)
             st.session_state.editing_memory_id = None
+            st.session_state.edit_mode = "create"
             st.session_state.page = "home"
             st.rerun()
 
@@ -2909,13 +3414,13 @@ div[data-testid="stHorizontalBlock"]:has(iframe[title*="streamlit_drawable_canva
     img = f'<img src="{src}">' if src else '<div style="color:#9aa; font-size:34px;">▧</div>'
     keywords = st.session_state.get("keywords") or ["추억사진", "인물사진", "옛날 분위기"]
     questions = st.session_state.get("questions") or [st.session_state.get("question", "이 사진을 찍던 날은 어떤 날이었나요?")]
-    era_text = "1980년대 후반(추정)"
-    summary_text = f"{', '.join(keywords[:2])} 분위기가 느껴지는 사진입니다. {questions[0]}"
+    analysis_label = st.session_state.get("analysis_label") or "사진 속 순간"
+    summary_text = f"{analysis_label} 장면으로 보여요. {', '.join(keywords[:2])}의 단서가 느껴집니다. {questions[0]}"
 
     with left_col:
         html(f'''
 <div class="write-title-dot"><span></span>기록 중</div>
-<div class="era-chip">▣ {era_text}</div>
+<div class="era-chip">▣ {escape(analysis_label)}</div>
 <div class="record-photo-card">{img}</div>
 <div class="ai-summary-card">
   <div class="ai-summary-title"><span>✦</span> AI 분석 요약</div>
@@ -3020,7 +3525,7 @@ elif page == "music":
         restore_photo(st.session_state.memory_id)
 
     if not st.session_state.spotify_tracks:
-        base_query = " ".join(st.session_state.get("keywords", [])) or "korean old pop memories"
+        base_query = photo_music_query()
         st.session_state.spotify_tracks = spotify_recommendations(base_query)
 
     st.markdown("""
@@ -3235,12 +3740,22 @@ div[data-testid="stAudio"] { margin: 6px 0 10px !important; }
                 st.markdown('<div class="music-hint">이 곡은 Spotify 미리듣기를 제공하지 않아요.</div>', unsafe_allow_html=True)
             st.markdown('<div style="height:10px"></div>', unsafe_allow_html=True)
             if st.button("이 노래로 저장하기", key="save_selected_music_tight_card", use_container_width=True):
-                save_memory()
-                go("category_loading")
+                edit_memory_id = st.session_state.get("editing_memory_id")
+                if edit_memory_id and st.session_state.get("edit_mode") == "music_edit":
+                    if update_memory_track(edit_memory_id, selected_track):
+                        finish_existing_music_edit()
+                        st.rerun()
+                    st.warning("음악을 저장할 기존 기록을 찾지 못했어요.")
+                else:
+                    save_memory(include_summary=False)
+                    go("category_loading")
         else:
             st.markdown('<div class="music-hint">노래 오른쪽 +를 누르면 저장할 노래로 선택돼요.</div>', unsafe_allow_html=True)
 
 elif page == "category_loading":
+    if is_existing_edit_flow():
+        finish_existing_music_edit()
+        st.rerun()
     st.markdown("""
 <style>
 .stApp, html, body { background:#efefef !important; overflow:hidden !important; }
@@ -3265,6 +3780,9 @@ header, [data-testid="stToolbar"], [data-testid="stDecoration"], #MainMenu, foot
     go("category_edit")
 
 elif page == "category_edit":
+    if is_existing_edit_flow():
+        finish_existing_music_edit()
+        st.rerun()
     options = category_candidates()
     selected_categories = ensure_selected_categories()
     if "category_direct_text" not in st.session_state:
@@ -3431,6 +3949,9 @@ header, [data-testid="stToolbar"], [data-testid="stDecoration"], #MainMenu, foot
     st.markdown('</div>', unsafe_allow_html=True)
 
 elif page == "album_done":
+    if is_existing_edit_flow():
+        finish_existing_music_edit()
+        st.rerun()
     memory = active_memory()
     photo_path = active_photo_path(memory)
     photo_src = image_src(photo_path)
@@ -3546,6 +4067,9 @@ header, [data-testid="stToolbar"], [data-testid="stDecoration"], #MainMenu, foot
             go("nfc_scan")
 
 elif page == "nfc_scan":
+    if is_existing_edit_flow():
+        finish_existing_music_edit()
+        st.rerun()
     html("""
 <style>
 .stApp { background:#efefef !important; }
@@ -3573,6 +4097,9 @@ header, [data-testid="stToolbar"], [data-testid="stDecoration"], #MainMenu, foot
 """)
 
 elif page == "nfc_done":
+    if is_existing_edit_flow():
+        finish_existing_music_edit()
+        st.rerun()
     html("""
 <style>
 .stApp { background:#efefef !important; }
