@@ -58,6 +58,9 @@ DEFAULTS = {
     ],
     "selected_category": "",
     "selected_categories": [],
+    "home_tab": "album",
+    "home_playing_memory_id": None,
+    "editing_memory_id": None,
 }
 
 for key, value in DEFAULTS.items():
@@ -67,6 +70,41 @@ for key, value in DEFAULTS.items():
 
 def go(page):
     st.session_state["page"] = page
+    st.rerun()
+
+
+def set_previous_page():
+    current = st.session_state.get("page", "home")
+    if current == "write":
+        preserve_write_inputs()
+    if current == "scan_upload":
+        st.session_state.page = "home"
+    elif current in ("scan_running", "analyzing", "scan_done"):
+        st.session_state.page = "scan_upload"
+    elif current == "write":
+        st.session_state.page = "scan_done"
+    elif current == "music":
+        st.session_state.page = "write"
+    elif current in ("category_loading", "category_edit"):
+        st.session_state.page = "music"
+    elif current == "album_done":
+        st.session_state.page = "category_edit"
+    elif current == "nfc_scan":
+        st.session_state.page = "album_done"
+    elif current == "nfc_done":
+        st.session_state.page = "nfc_scan"
+    elif current == "video":
+        st.session_state.page = "album_done"
+    elif current in ("player", "player_legacy"):
+        st.session_state.page = "video"
+    elif current == "memory_edit":
+        st.session_state.page = "home"
+    else:
+        st.session_state.page = "home"
+
+
+def go_back():
+    set_previous_page()
     st.rerun()
 
 
@@ -95,10 +133,47 @@ def reset_flow():
     ]
     st.session_state.selected_category = ""
     st.session_state.selected_categories = []
+    st.session_state.home_playing_memory_id = None
 
 
 def html(markup):
     st.markdown(markup.strip(), unsafe_allow_html=True)
+
+
+REPLAY_LOGO_SVG = """
+<svg viewBox="0 0 213 96" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="RE:PLAY logo">
+  <g fill="#000">
+    <rect x="32" y="10" width="14" height="43"/>
+    <rect x="52" y="10" width="14" height="43"/>
+    <circle cx="88" cy="31.5" r="21.5"/>
+    <polygon points="108,10 146,31.5 108,53"/>
+    <polygon points="144,10 159,10 139,53 124,53"/>
+    <rect x="161" y="10" width="14" height="43"/>
+  </g>
+  <rect x="70" y="26.5" width="58" height="10" fill="#fff"/>
+  <polygon points="108,10 146,31.5 108,53" fill="#000"/>
+  <polygon points="144,10 159,10 139,53 124,53" fill="#000"/>
+  <text x="32" y="73" fill="#000" font-family="Arial Black, Arial, sans-serif" font-size="16" font-weight="900" letter-spacing="7">RE : PLAY</text>
+</svg>
+"""
+REPLAY_LOGO_SRC = f"data:image/svg+xml;charset=utf-8,{quote(REPLAY_LOGO_SVG.strip())}"
+SPLASH_LOGO_HTML = f'<img class="replay-logo-img splash-logo-img" src="{REPLAY_LOGO_SRC}" alt="RE:PLAY logo">'
+HOME_LOGO_HTML = f'<img class="replay-logo-img home-brand-logo" src="{REPLAY_LOGO_SRC}" alt="RE:PLAY logo">'
+FLOW_LOGO_HTML = f'<img class="replay-logo-img flow-logo-img" src="{REPLAY_LOGO_SRC}" alt="RE:PLAY logo">'
+
+
+def render_global_back_button():
+    if st.session_state.get("page") in ("splash", "home"):
+        return
+    html("""
+<style>
+a.back,
+a.music-back,
+.st-key-write_back_button {
+    display:none !important;
+}
+</style>
+""")
 
 
 def image_to_base64(path):
@@ -392,6 +467,178 @@ def memory_categories(memory):
     return categories
 
 
+def memory_title(memory):
+    title = str(memory.get("title") or "").strip()
+    if title:
+        return title
+    categories = memory_categories(memory)
+    if categories:
+        return categories[0]
+    category = str(memory.get("category") or "").strip()
+    if category:
+        return category.split(",")[0].strip()
+    return "이름 없는 추억"
+
+
+def memory_note_preview(memory, limit=32):
+    note = " ".join(str(memory.get("note") or "").split())
+    if not note:
+        return "아직 기록된 문장이 없어요."
+    return note if len(note) <= limit else f"{note[:limit]}..."
+
+
+def memory_json_path(memory_id):
+    return os.path.join(MEMORY_DIR, f"{memory_id}.json")
+
+
+def save_memory_record(memory):
+    memory_id = memory.get("id")
+    if not memory_id:
+        return
+    with open(memory_json_path(memory_id), "w", encoding="utf-8") as file:
+        json.dump(memory, file, ensure_ascii=False, indent=2)
+
+
+def parse_category_text(text):
+    raw = str(text or "").strip()
+    if not raw:
+        return []
+    if "#" in raw:
+        parts = raw.split("#")
+    else:
+        parts = raw.split(",")
+    categories = []
+    for part in parts:
+        category = part.strip().strip(",")
+        if category and category not in categories:
+            categories.append(category)
+    return categories
+
+
+def group_memories_by_category(source_memories=None):
+    grouped = {}
+    for memory in source_memories or load_memories():
+        categories = memory_categories(memory) or ["이름 없는 앨범"]
+        for category in categories:
+            grouped.setdefault(category, []).append(memory)
+    return grouped
+
+
+def shared_family_members():
+    return [
+        {"name": "나", "status": "지금 듣는 중", "active": True},
+        {"name": "엄마", "status": "2시간 전", "active": False},
+        {"name": "아빠", "status": "5시간 전", "active": False},
+        {"name": "동생", "status": "1일 전", "active": False},
+    ]
+
+
+def memory_primary_category(memory):
+    categories = memory_categories(memory or {})
+    if categories:
+        return categories[0]
+    category = str((memory or {}).get("category") or "").strip()
+    return category.split(",")[0].strip() if category else ""
+
+
+def family_memory_title(memory, fallback="오늘의 추억"):
+    title = str((memory or {}).get("title") or "").strip()
+    if title:
+        return title
+    category = memory_primary_category(memory)
+    return category or fallback
+
+
+def family_track_text(memory):
+    track = (memory or {}).get("selected_track") or {}
+    title = str(track.get("title") or "").strip()
+    artist = str(track.get("artist") or "").strip()
+    if title and artist:
+        return f"{title} - {artist}"
+    if title:
+        return title
+    return "가족과 함께 들을 추억"
+
+
+def family_photo_html(memory, class_name=""):
+    src = image_src(photo_path_for_memory(memory or {}))
+    if src:
+        return f'<img class="{class_name}" src="{escape(src, quote=True)}" alt="">'
+    return '<div class="family-photo-placeholder">사진 없음</div>'
+
+
+def family_playlist_groups(source_memories=None):
+    memories = source_memories if source_memories is not None else load_memories()
+    grouped = group_memories_by_category(memories)
+    if not grouped and memories:
+        grouped = {"우리 가족": memories}
+    return sorted(grouped.items(), key=lambda item: len(item[1]), reverse=True)
+
+
+def resolve_category_from_nfc_uid(uid):
+    # Future Firebase hook: UID -> category.
+    return None
+
+
+def open_category_album_from_uid(uid):
+    category = resolve_category_from_nfc_uid(uid)
+    if not category:
+        return False
+    return open_category_album(category)
+
+
+def selected_category_album_memories(category=None):
+    picked_category = (
+        category
+        or st.session_state.get("selected_category")
+        or st.session_state.get("album_category")
+        or ""
+    )
+    if isinstance(picked_category, str) and "," in picked_category:
+        picked_category = picked_category.split(",")[0].strip()
+    return album_memories_for_category(picked_category)
+
+
+def open_memory_from_home(memory_id):
+    picked = next((memory for memory in load_memories() if memory.get("id") == memory_id), None)
+    if not picked:
+        return
+    categories = memory_categories(picked)
+    open_category_album(categories[0] if categories else "", memory_id)
+
+
+def open_memory_edit(memory_id):
+    if not memory_id:
+        return
+    select_album_memory(memory_id)
+    st.session_state.editing_memory_id = memory_id
+    st.session_state.page = "memory_edit"
+
+
+def open_music_edit(memory_id):
+    picked = next((memory for memory in load_memories() if memory.get("id") == memory_id), None)
+    if not picked:
+        reset_flow()
+        st.session_state.page = "music"
+        return
+    select_album_memory(memory_id)
+    st.session_state.selected_track = picked.get("selected_track")
+    st.session_state.page = "music"
+
+
+def clear_memory_track(memory_id):
+    picked = next((memory for memory in load_memories() if memory.get("id") == memory_id), None)
+    if not picked:
+        return
+    picked["selected_track"] = None
+    save_memory_record(picked)
+    if st.session_state.get("home_playing_memory_id") == memory_id:
+        st.session_state.home_playing_memory_id = None
+    if st.session_state.get("selected_memory_id") == memory_id:
+        st.session_state.selected_track = None
+        st.session_state.play_memory = picked
+
+
 def album_category_from_state(memory=None):
     explicit = str(st.session_state.get("album_category") or "").strip()
     if explicit:
@@ -406,11 +653,14 @@ def album_category_from_state(memory=None):
     return categories[0] if categories else ""
 
 
-def album_memories_for_category(category):
-    all_memories = load_memories()
+def album_memories_for_category(category=None, source_memories=None, strict=False):
+    all_memories = source_memories if source_memories is not None else load_memories()
+    if category is None:
+        category = album_category_from_state(st.session_state.get("play_memory") or {})
+    category = str(category or "").strip()
     if category:
         filtered = [memory for memory in all_memories if category in memory_categories(memory)]
-        if filtered:
+        if filtered or strict:
             return filtered
     selected_id = st.session_state.get("album_selected_memory_id") or st.session_state.get("selected_memory_id")
     if selected_id:
@@ -449,11 +699,18 @@ def select_album_memory(memory_id):
 
 
 def open_category_album(category=None, memory_id=None):
+    category = str(category or "").strip()
+    album_memories = album_memories_for_category(category, strict=bool(category))
     if category:
         st.session_state.album_category = category
     if memory_id:
         select_album_memory(memory_id)
+    elif album_memories:
+        select_album_memory(album_memories[0].get("id"))
+        if category:
+            st.session_state.album_category = category
     st.session_state.page = "video"
+    return bool(memory_id or album_memories)
 
 
 def active_memory():
@@ -645,11 +902,29 @@ action = st.query_params.get("action")
 memory_id = st.query_params.get("memory")
 note_text = st.query_params.get("note")
 mode = st.query_params.get("mode")
+tab = st.query_params.get("tab")
+category_param = st.query_params.get("category")
 if memory_id:
     restore_photo(memory_id)
 if action:
     if action == "home":
         st.session_state.page = "home"
+    elif action == "family_home":
+        st.session_state.page = "family_home"
+    elif action == "home_tab":
+        if tab in ("album", "music"):
+            st.session_state.home_tab = tab
+        st.session_state.page = "home"
+    elif action == "family_music":
+        st.session_state.home_tab = "music"
+        st.session_state.page = "home"
+    elif action == "family_play" and memory_id:
+        open_memory_from_home(memory_id)
+    elif action == "family_category":
+        if category_param:
+            open_category_album(category_param)
+        else:
+            st.session_state.page = "family_home"
     elif action == "record":
         reset_flow()
         st.session_state.page = "scan_upload"
@@ -669,6 +944,19 @@ if action:
             st.session_state.album_category = categories[0] if categories else ""
             st.session_state.album_selected_memory_id = memory_id
         open_category_album(st.session_state.get("album_category"), memory_id)
+    elif action == "edit" and memory_id:
+        open_memory_edit(memory_id)
+    elif action == "music_edit" and memory_id:
+        st.session_state.home_tab = "music"
+        open_music_edit(memory_id)
+    elif action == "music_delete" and memory_id:
+        clear_memory_track(memory_id)
+        st.session_state.home_tab = "music"
+        st.session_state.page = "home"
+    elif action == "home_music_play" and memory_id:
+        st.session_state.home_tab = "music"
+        st.session_state.home_playing_memory_id = memory_id
+        st.session_state.page = "home"
     elif action == "playback":
         picked = next((m for m in memories if m.get("id") == st.session_state.selected_memory_id), None)
         if picked:
@@ -723,27 +1011,7 @@ if action:
         st.session_state.play_memory = None
         st.session_state.page = "home"
     elif action == "back":
-        current = st.session_state.page
-        if current in ("scan_upload", "player", "category_loading"):
-            st.session_state.page = "home"
-        elif current in ("scan_running", "analyzing", "scan_done"):
-            st.session_state.page = "scan_upload"
-        elif current == "write":
-            st.session_state.page = "scan_done"
-        elif current == "music":
-            st.session_state.page = "write"
-        elif current == "category_edit":
-            st.session_state.page = "music"
-        elif current == "album_done":
-            st.session_state.page = "category_edit"
-        elif current == "nfc_scan":
-            st.session_state.page = "album_done"
-        elif current == "nfc_done":
-            st.session_state.page = "nfc_scan"
-        elif current == "video":
-            st.session_state.page = "album_done"
-        else:
-            st.session_state.page = "home"
+        set_previous_page()
     st.query_params.clear()
     st.rerun()
 
@@ -758,15 +1026,13 @@ a { color:inherit; text-decoration:none; }
 
 .app-card { width:760px; max-width:100%; margin:0 auto; background:#fff; overflow:hidden; }
 .brand { font-size:15px; font-weight:900; }
-.brand span, .splash-title span { color:#f26a2e; }
 
-.splash { height:410px; position:relative; display:flex; justify-content:center; align-items:center; overflow:hidden; }
+.splash { height:508px; position:relative; display:flex; justify-content:center; align-items:center; overflow:hidden; background:#fff; }
 .splash-hit { position:absolute; inset:0; z-index:5; }
-.splash-title { font-size:30px; font-weight:900; z-index:2; transform:translateY(-36px); }
-.orb-main { position:absolute; width:140px; height:140px; border-radius:50%; background:#ff6a24; filter:blur(8px); left:48%; top:52%; transform:translate(-50%, -50%); }
-.orb-soft { position:absolute; width:230px; height:230px; border-radius:50%; background:rgba(255,255,255,.72); left:7%; bottom:-70px; }
-.orb-small { position:absolute; width:78px; height:78px; border-radius:50%; background:rgba(255,255,255,.72); border:1px solid rgba(255,255,255,.8); left:55%; top:45%; }
-.dot { position:absolute; width:26px; height:26px; border-radius:50%; background:rgba(255,106,36,.18); left:39%; top:33%; }
+.replay-logo-img { display:block; object-fit:contain; }
+.splash-logo-img { width:213px; height:auto; transform:translateY(8px); }
+.home-brand-logo { width:118px; height:auto; }
+.flow-logo-img { width:92px; height:auto; margin:0 auto; transform:translateY(-6px); }
 
 .home { min-height:410px; padding:32px 38px; background:radial-gradient(circle at 48% -7%, rgba(255,111,43,.55), rgba(255,160,102,.18) 18%, transparent 32%), linear-gradient(180deg, #fff7f3 0%, #fff 72%); }
 .memory-panel { margin-top:26px; padding:24px; min-height:230px; border-radius:16px; background:rgba(255,255,255,.72); box-shadow:0 22px 46px rgba(0,0,0,.06); }
@@ -920,44 +1186,1385 @@ iframe[title*="streamlit_drawable_canvas"] { display:block; border-radius:14px; 
 
 
 page = st.session_state["page"]
+render_global_back_button()
 
 if page == "splash":
-    html("""
+    html(f"""
 <div class="app-card splash">
   <a class="splash-hit" href="?action=home" target="_self"></a>
-  <div class="dot"></div>
-  <div class="orb-soft"></div>
-  <div class="orb-main"></div>
-  <div class="orb-small"></div>
-  <div class="splash-title">Re<span>:</span>Play</div>
+  {SPLASH_LOGO_HTML}
 </div>
 """)
 
 elif page == "home":
-    tiles = "".join(
-        tile_html(memory, memory.get("id") == st.session_state.selected_memory_id)
-        for memory in memories
-    )
-    tiles += '<a class="tile" href="?action=record" target="_self">+</a>'
-    html(f"""
-<div class="app-card home">
-  <div class="brand">Re<span>:</span>Play</div>
-  <div class="memory-panel">
-    <div class="tile-grid">{tiles}</div>
+    home_memories = load_memories()
+    memory_count = len(home_memories)
+    current_tab = st.session_state.get("home_tab", "album")
+    active_album = current_tab == "album"
+    active_music = current_tab == "music"
+    album_tab_class = " active" if active_album else ""
+    music_tab_class = " active" if active_music else ""
+    kicker_html = '<div class="home-kicker">RE:01</div>' if active_album else ""
+
+    album_cards = []
+    for memory in home_memories:
+        memory_id_value = str(memory.get("id") or "")
+        memory_id_query = quote(memory_id_value)
+        photo_src = image_src(photo_path_for_memory(memory))
+        photo_html = (
+            f'<img src="{escape(photo_src, quote=True)}" alt="">'
+            if photo_src
+            else '<span class="home-photo-empty"></span>'
+        )
+        title = escape(memory_title(memory))
+        preview = escape(memory_note_preview(memory, 34))
+        album_cards.append(f"""
+<article class="home-album-card">
+  <a class="home-card-photo-link" href="?action=select&memory={memory_id_query}" target="_self">
+    <div class="home-card-photo">{photo_html}</div>
+  </a>
+  <div class="home-card-title">{title}</div>
+  <div class="home-card-bottom">
+    <div class="home-card-note">{preview}</div>
+    <a class="home-card-edit" href="?action=edit&memory={memory_id_query}" target="_self" aria-label="수정">✎</a>
   </div>
-  <div class="bottom-actions">
-    <a class="left" href="?action=record" target="_self">기억 기록하기</a>
-    <a class="right" href="?action=playback" target="_self">추억 재생하기</a>
+</article>
+""")
+
+    if home_memories:
+        for _ in range(max(0, 4 - len(home_memories))):
+            album_cards.append("""
+<article class="home-album-card home-album-card-empty">
+  <div class="home-card-photo"><span class="home-photo-empty"></span></div>
+  <div class="home-card-title">이름 없는 추억</div>
+  <div class="home-card-bottom">
+    <div class="home-card-note">새 기록이 생기면 이곳에 보여요.</div>
+    <span class="home-card-edit ghost">✎</span>
+  </div>
+</article>
+""")
+
+    album_content = (
+        '<div class="home-album-strip">' + "".join(album_cards) + "</div>"
+        if album_cards
+        else '<div class="home-empty">아직 저장된 추억이 없어요.<br>아래 버튼으로 첫 기억을 기록해보세요.</div>'
+    )
+
+    music_memories = [memory for memory in home_memories if memory.get("selected_track")]
+    home_audio_html = ""
+    playing_id = st.session_state.get("home_playing_memory_id")
+    playing_memory = next((memory for memory in music_memories if memory.get("id") == playing_id), None)
+    if playing_memory:
+        playing_track = playing_memory.get("selected_track") or {}
+        audio_src = playing_track.get("file") or playing_track.get("preview_url")
+        if audio_src:
+            home_audio_html = f"""
+<div class="home-now-playing">
+  <div>{escape(playing_track.get("title") or "선택한 음악")}</div>
+  <audio controls autoplay src="{escape(audio_src, quote=True)}"></audio>
+</div>
+"""
+
+    if music_memories:
+        primary_memory = playing_memory or music_memories[0]
+        primary_track = primary_memory.get("selected_track") or {}
+        primary_cover_src = primary_track.get("image") or image_src(photo_path_for_memory(primary_memory))
+        primary_cover = (
+            f'<img src="{escape(primary_cover_src, quote=True)}" alt="">'
+            if primary_cover_src
+            else '<span>♪</span>'
+        )
+        track_rows = []
+        for memory in music_memories:
+            memory_id_value = str(memory.get("id") or "")
+            memory_id_query = quote(memory_id_value)
+            track = memory.get("selected_track") or {}
+            cover_src = track.get("image") or image_src(photo_path_for_memory(memory))
+            cover_html = (
+                f'<img src="{escape(cover_src, quote=True)}" alt="">'
+                if cover_src
+                else '<span>♪</span>'
+            )
+            title = escape(track.get("title") or "노래 제목")
+            artist = escape(track.get("artist") or "가수")
+            audio_source = track.get("file") or track.get("preview_url")
+            play_href = f"?action=home_music_play&memory={memory_id_query}" if audio_source else "#"
+            playing_class = " playing" if memory.get("id") == playing_id else ""
+            disabled_class = "" if audio_source else " disabled"
+            track_rows.append(f"""
+<div class="home-track-row{playing_class}">
+  <div class="home-track-cover">{cover_html}</div>
+  <div class="home-track-copy">
+    <div class="home-track-title">{title}</div>
+    <div class="home-track-artist">By {artist}</div>
+  </div>
+  <div class="home-track-actions">
+    <a class="home-track-play{disabled_class}" href="{play_href}" target="_self" aria-label="재생">▶</a>
+    <a class="home-track-edit" href="?action=music_edit&memory={memory_id_query}" target="_self" aria-label="수정">✎</a>
+    <a class="home-track-delete" href="?action=music_delete&memory={memory_id_query}" target="_self" aria-label="삭제">삭제</a>
   </div>
 </div>
 """)
+        music_content = f"""
+<div class="home-music-layout">
+  <div class="home-music-hero">{primary_cover}</div>
+  <div class="home-track-list">{"".join(track_rows)}{home_audio_html}</div>
+</div>
+"""
+    else:
+        music_content = '<div class="home-empty">아직 연결된 음악이 없어요.<br>기억을 기록하면서 음악을 골라보세요.</div>'
+
+    content_html = album_content if active_album else music_content
+
+    html(f"""
+<style>
+.stApp {{ background:#f0f0f0 !important; color:#111 !important; }}
+.block-container {{
+    max-width:980px !important;
+    min-height:690px !important;
+    margin:0 auto !important;
+    padding:32px 34px 42px !important;
+    background:
+      radial-gradient(circle at 52% 0%, rgba(255,128,74,.27), rgba(255,238,228,.46) 20%, transparent 39%),
+      linear-gradient(180deg, #fbf6f2 0%, #f2f2f2 46%, #f7f7f7 100%) !important;
+    overflow:hidden !important;
+    position:relative !important;
+}}
+header, [data-testid="stToolbar"], [data-testid="stDecoration"], #MainMenu, footer {{ display:none !important; }}
+div[data-testid="stVerticalBlock"] {{ gap:0 !important; }}
+.home-header {{
+    display:flex;
+    align-items:flex-start;
+    justify-content:space-between;
+    min-height:78px;
+}}
+.home-logo {{
+    width:118px;
+    color:#050505;
+    display:flex;
+    flex-direction:column;
+    align-items:flex-start;
+}}
+.home-tools {{
+    display:flex;
+    align-items:center;
+    gap:18px;
+    padding-right:18px;
+}}
+.home-search-button,
+.home-family-button,
+.home-help-button {{
+    height:54px;
+    border-radius:999px;
+    background:#fff;
+    box-shadow:0 18px 34px rgba(0,0,0,.045);
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    color:#050505;
+}}
+.home-search-button {{ width:144px; justify-content:flex-end; padding-right:28px; }}
+.home-family-button {{ min-width:92px; padding:0 22px; font-size:14px; font-weight:1000; }}
+.home-help-button {{ width:54px; font-size:28px; font-weight:500; }}
+.home-search-icon {{
+    width:18px;
+    height:18px;
+    border:3px solid #050505;
+    border-radius:50%;
+    position:relative;
+    display:block;
+}}
+.home-search-icon::after {{
+    content:"";
+    position:absolute;
+    width:10px;
+    height:3px;
+    right:-8px;
+    bottom:-5px;
+    border-radius:999px;
+    background:#050505;
+    transform:rotate(45deg);
+}}
+.home-title-zone {{
+    width:calc(100% - 96px);
+    margin:0 0 0 64px;
+}}
+.home-kicker {{
+    color:#ff5b18;
+    font-size:16px;
+    font-weight:800;
+    line-height:1;
+    margin-bottom:9px;
+}}
+.home-title {{
+    margin:0;
+    font-size:32px;
+    line-height:1.08;
+    font-weight:1000;
+    letter-spacing:0;
+}}
+.home-tab-row {{
+    height:56px;
+    margin-top:24px;
+    border-bottom:1px solid #d2d2d2;
+    display:flex;
+    align-items:flex-start;
+    gap:46px;
+}}
+.home-tab {{
+    height:39px;
+    display:flex;
+    align-items:flex-start;
+    color:#4d4d4d;
+    font-size:16px;
+    font-weight:900;
+    border-bottom:3px solid transparent;
+}}
+.home-tab.active {{
+    color:#ff5b18;
+    border-bottom-color:#ff5b18;
+}}
+.home-count {{
+    margin-left:auto;
+    padding-top:2px;
+    color:#444;
+    font-size:15px;
+    font-weight:700;
+}}
+.home-content {{
+    margin:50px -34px 0 50px;
+    min-height:252px;
+}}
+.home-album-strip {{
+    display:flex;
+    gap:34px;
+    overflow-x:auto;
+    overflow-y:hidden;
+    padding:0 34px 16px 0;
+    scroll-snap-type:x proximity;
+    scrollbar-width:none;
+}}
+.home-album-strip::-webkit-scrollbar {{ display:none; }}
+.home-album-card {{
+    flex:0 0 226px;
+    min-height:252px;
+    border-radius:14px;
+    background:#fff;
+    box-shadow:0 16px 32px rgba(0,0,0,.045);
+    padding:10px;
+    scroll-snap-align:start;
+}}
+.home-card-photo-link {{
+    display:block;
+    border-radius:10px;
+    overflow:hidden;
+}}
+.home-card-photo {{
+    height:145px;
+    border-radius:10px;
+    background:#eeeeee;
+    overflow:hidden;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+}}
+.home-card-photo img {{
+    width:100%;
+    height:100%;
+    object-fit:cover;
+    display:block;
+}}
+.home-photo-empty {{
+    width:100%;
+    height:100%;
+    background:#eeeeee;
+    display:block;
+}}
+.home-card-title {{
+    margin:15px 7px 0;
+    min-height:24px;
+    color:#111;
+    font-size:16px;
+    line-height:1.28;
+    font-weight:900;
+    white-space:nowrap;
+    overflow:hidden;
+    text-overflow:ellipsis;
+}}
+.home-card-bottom {{
+    margin:15px 6px 0 7px;
+    display:grid;
+    grid-template-columns:1fr 44px;
+    gap:12px;
+    align-items:center;
+}}
+.home-card-note {{
+    color:#858585;
+    font-size:12px;
+    line-height:1.35;
+    white-space:nowrap;
+    overflow:hidden;
+    text-overflow:ellipsis;
+}}
+.home-card-edit {{
+    width:38px;
+    height:38px;
+    border-radius:9px;
+    background:#333;
+    color:#fff;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    font-size:22px;
+    line-height:1;
+    box-shadow:none;
+}}
+.home-card-edit.ghost {{
+    opacity:.45;
+}}
+.home-album-card-empty {{
+    background:rgba(255,255,255,.76);
+}}
+.home-music-layout {{
+    display:grid;
+    grid-template-columns:39% 1fr;
+    gap:62px;
+    align-items:center;
+    padding:0 54px 0 28px;
+}}
+.home-music-hero {{
+    width:190px;
+    height:190px;
+    justify-self:center;
+    border-radius:8px;
+    background:#eee;
+    overflow:hidden;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    color:#999;
+    font-size:40px;
+    box-shadow:0 16px 36px rgba(0,0,0,.06);
+}}
+.home-music-hero img {{
+    width:100%;
+    height:100%;
+    object-fit:cover;
+    display:block;
+}}
+.home-track-list {{
+    max-height:328px;
+    overflow-y:auto;
+    padding-right:6px;
+    scrollbar-width:none;
+}}
+.home-track-list::-webkit-scrollbar {{ display:none; }}
+.home-track-row {{
+    min-height:55px;
+    display:grid;
+    grid-template-columns:48px 1fr 118px;
+    gap:14px;
+    align-items:center;
+    margin-bottom:12px;
+}}
+.home-track-cover {{
+    width:44px;
+    height:44px;
+    border-radius:3px;
+    background:#d9d9d9;
+    overflow:hidden;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    color:#888;
+    font-size:18px;
+}}
+.home-track-cover img {{
+    width:100%;
+    height:100%;
+    object-fit:cover;
+    display:block;
+}}
+.home-track-title {{
+    color:#111;
+    font-size:16px;
+    line-height:1.18;
+    font-weight:800;
+    white-space:nowrap;
+    overflow:hidden;
+    text-overflow:ellipsis;
+}}
+.home-track-row.playing .home-track-title {{
+    color:#ff5b18;
+}}
+.home-track-artist {{
+    margin-top:5px;
+    color:#888;
+    font-size:12px;
+    line-height:1.1;
+    white-space:nowrap;
+    overflow:hidden;
+    text-overflow:ellipsis;
+}}
+.home-track-actions {{
+    display:flex;
+    align-items:center;
+    justify-content:flex-end;
+    gap:10px;
+}}
+.home-track-play {{
+    color:#ff5b18;
+    font-size:26px;
+    line-height:1;
+    font-weight:900;
+}}
+.home-track-play.disabled {{
+    opacity:.28;
+    pointer-events:none;
+}}
+.home-track-edit,
+.home-track-delete {{
+    min-width:32px;
+    height:28px;
+    border-radius:999px;
+    background:#fff;
+    box-shadow:0 8px 16px rgba(0,0,0,.07);
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    color:#333;
+    font-size:12px;
+    font-weight:900;
+}}
+.home-track-edit {{
+    font-size:18px;
+}}
+.home-track-delete {{
+    color:#cf4b38;
+    padding:0 10px;
+}}
+.home-now-playing {{
+    margin-top:12px;
+    padding:12px 14px;
+    border-radius:14px;
+    background:rgba(255,255,255,.78);
+    box-shadow:0 10px 22px rgba(0,0,0,.055);
+    color:#444;
+    font-size:12px;
+    font-weight:800;
+}}
+.home-now-playing audio {{
+    width:100%;
+    height:34px;
+    margin-top:8px;
+}}
+.home-empty {{
+    min-height:300px;
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+    justify-content:center;
+    color:#777;
+    font-size:16px;
+    line-height:1.6;
+    text-align:center;
+}}
+.home-footer-actions {{
+    position:relative;
+    left:auto;
+    right:auto;
+    bottom:auto;
+    margin:42px 44px 0 44px;
+    display:grid;
+    grid-template-columns:1fr 1fr;
+    gap:70px;
+}}
+.home-footer-actions a {{
+    height:58px;
+    border-radius:20px;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    font-size:18px;
+    font-weight:1000;
+    box-shadow:0 16px 30px rgba(0,0,0,.10);
+    text-decoration:none !important;
+}}
+.home-record-button {{
+    background:#111;
+    color:#fff !important;
+}}
+.home-play-button {{
+    background:#fff;
+    color:#111 !important;
+}}
+@media (max-width:900px) {{
+    .block-container {{
+        max-width:820px !important;
+        min-height:600px !important;
+        padding:28px 26px 36px !important;
+    }}
+    .home-title-zone {{
+        width:100%;
+        margin-left:30px;
+    }}
+    .home-content {{
+        margin:42px -26px 0 30px;
+    }}
+    .home-album-card {{
+        flex-basis:226px;
+        min-height:252px;
+    }}
+    .home-card-photo {{
+        height:145px;
+    }}
+    .home-music-layout {{
+        grid-template-columns:36% 1fr;
+        gap:52px;
+        padding:0 36px 0 28px;
+    }}
+    .home-music-hero {{
+        width:178px;
+        height:178px;
+    }}
+    .home-track-row {{
+        grid-template-columns:36px 1fr 90px;
+        gap:10px;
+    }}
+    .home-track-cover {{
+        width:34px;
+        height:34px;
+    }}
+    .home-track-title {{
+        font-size:13px;
+    }}
+    .home-track-artist {{
+        font-size:10px;
+    }}
+    .home-footer-actions {{
+        margin:38px 10px 0 10px;
+        gap:44px;
+    }}
+    .home-footer-actions a {{
+        height:58px;
+        font-size:18px;
+    }}
+}}
+</style>
+<div class="home-header">
+  <div class="home-logo">{HOME_LOGO_HTML}</div>
+  <div class="home-tools">
+    <a class="home-search-button" href="#" aria-label="검색"><span class="home-search-icon"></span></a>
+    <a class="home-family-button" href="?action=family_home" target="_self">가족앱</a>
+    <a class="home-help-button" href="#" aria-label="도움말">?</a>
+  </div>
+</div>
+<section class="home-title-zone">
+  {kicker_html}
+  <h1 class="home-title">우리 가족</h1>
+  <div class="home-tab-row">
+    <a class="home-tab{album_tab_class}" href="?action=home_tab&tab=album" target="_self">앨범</a>
+    <a class="home-tab{music_tab_class}" href="?action=home_tab&tab=music" target="_self">음악</a>
+    <div class="home-count">{memory_count}장의 추억 보관중</div>
+  </div>
+</section>
+<main class="home-content">{content_html}</main>
+<div class="home-footer-actions">
+  <a class="home-record-button" href="?action=record" target="_self">기억 기록하기</a>
+  <a class="home-play-button" href="?action=playback" target="_self">추억 재생하기</a>
+</div>
+""")
+
+elif page == "family_home":
+    family_memories = load_memories()
+    latest_memory = family_memories[0] if family_memories else None
+    total_count = len(family_memories)
+
+    if latest_memory:
+        latest_category = memory_primary_category(latest_memory)
+        latest_group = (
+            album_memories_for_category(latest_category, source_memories=family_memories, strict=True)
+            if latest_category
+            else [latest_memory]
+        )
+        latest_count = len(latest_group) or 1
+        latest_title = escape(family_memory_title(latest_memory))
+        latest_track = escape(family_track_text(latest_memory))
+        latest_photo = family_photo_html(latest_memory, "family-hero-photo")
+        latest_href = f'?action=family_play&memory={quote(str(latest_memory.get("id") or ""))}'
+        latest_count_text = f"{latest_count}개의 기록"
+    else:
+        latest_title = "오늘의 추억"
+        latest_track = "아직 가족에게 공유된 추억이 없어요."
+        latest_photo = '<div class="family-photo-placeholder">사진 없음</div>'
+        latest_href = "#"
+        latest_count_text = "0개의 기록"
+
+    recent_cards = []
+    for memory in family_memories[:12]:
+        memory_id_value = str(memory.get("id") or "")
+        memory_id_query = quote(memory_id_value)
+        category = memory_primary_category(memory)
+        grouped_count = (
+            len(album_memories_for_category(category, source_memories=family_memories, strict=True))
+            if category
+            else 1
+        )
+        photo_html = family_photo_html(memory, "family-recent-photo")
+        title = escape(family_memory_title(memory))
+        track = escape(family_track_text(memory))
+        recent_cards.append(f"""
+<a class="family-recent-card" href="?action=family_play&memory={memory_id_query}" target="_self">
+  <div class="family-recent-photo-wrap">{photo_html}</div>
+  <div class="family-recent-title">{title}</div>
+  <div class="family-recent-meta">{grouped_count}개의 기록</div>
+  <div class="family-recent-track">{track}</div>
+</a>
+""")
+    recent_html = (
+        '<div class="family-scroll-row">' + "".join(recent_cards) + "</div>"
+        if recent_cards
+        else '<div class="family-empty">최근 재생할 추억이 아직 없어요.</div>'
+    )
+
+    member_rows = []
+    for member in shared_family_members():
+        active_class = " active" if member.get("active") else ""
+        initial = escape(str(member.get("name", ""))[:1])
+        member_rows.append(f"""
+<div class="family-member">
+  <div class="family-avatar{active_class}">{initial}</div>
+  <div>
+    <div class="family-member-name">{escape(member.get("name", ""))}</div>
+    <div class="family-member-status">{escape(member.get("status", ""))}</div>
+  </div>
+</div>
+""")
+    members_html = "".join(member_rows)
+
+    playlist_cards = []
+    for category, items in family_playlist_groups(family_memories)[:8]:
+        if not category:
+            continue
+        category_query = quote(str(category))
+        first_memory = items[0] if items else {}
+        photo_html = family_photo_html(first_memory, "family-playlist-photo")
+        playlist_cards.append(f"""
+<a class="family-playlist-card" href="?action=family_category&category={category_query}" target="_self">
+  <div class="family-playlist-cover">{photo_html}<span></span></div>
+  <div class="family-playlist-copy">
+    <div class="family-playlist-title">{escape(category)} Playlist</div>
+    <div class="family-playlist-meta">{len(items)}개의 추억</div>
+    <div class="family-playlist-track">{escape(family_track_text(first_memory))}</div>
+  </div>
+</a>
+""")
+    playlist_html = (
+        '<div class="family-playlist-list">' + "".join(playlist_cards) + "</div>"
+        if playlist_cards
+        else '<div class="family-empty">카테고리가 생기면 추천 플레이리스트가 만들어져요.</div>'
+    )
+
+    html(f"""
+<style>
+.stApp {{ background:#f0f0f0 !important; color:#111 !important; }}
+.block-container {{
+    max-width:560px !important;
+    min-height:860px !important;
+    margin:0 auto !important;
+    padding:20px 18px 28px !important;
+    background:
+      radial-gradient(circle at 72% 0%, rgba(255,143,94,.30), transparent 31%),
+      linear-gradient(180deg, #fff8f3 0%, #fff 42%, #f6f3f0 100%) !important;
+    overflow:visible !important;
+    position:relative !important;
+}}
+header, [data-testid="stToolbar"], [data-testid="stDecoration"], #MainMenu, footer {{ display:none !important; }}
+div[data-testid="stVerticalBlock"] {{ gap:0 !important; }}
+.family-shell {{ padding:8px 4px 0; }}
+.family-top {{
+    display:flex;
+    align-items:flex-start;
+    justify-content:space-between;
+    min-height:92px;
+}}
+.family-logo {{ width:118px; padding-top:8px; }}
+.family-top-icons {{ display:flex; align-items:center; gap:12px; }}
+.family-icon {{
+    width:42px;
+    height:42px;
+    border-radius:50%;
+    background:#fff;
+    box-shadow:0 14px 28px rgba(0,0,0,.07);
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    font-size:18px;
+    font-weight:1000;
+}}
+.family-greeting {{ margin:4px 0 22px; }}
+.family-greeting h1 {{
+    margin:0;
+    font-size:28px;
+    line-height:1.18;
+    font-weight:1000;
+    letter-spacing:0;
+}}
+.family-greeting p {{
+    margin:8px 0 0;
+    color:#8b817b;
+    font-size:14px;
+    font-weight:800;
+}}
+.family-section-head {{
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    margin:24px 2px 12px;
+}}
+.family-section-title {{
+    font-size:17px;
+    font-weight:1000;
+}}
+.family-section-count {{
+    color:#ef5a28;
+    font-size:12px;
+    font-weight:1000;
+}}
+.family-today-card {{
+    border-radius:28px;
+    background:linear-gradient(145deg, #fff 0%, #fff6ef 100%);
+    box-shadow:0 22px 44px rgba(110,72,48,.12);
+    padding:18px;
+    overflow:hidden;
+}}
+.family-art-row {{
+    height:190px;
+    position:relative;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+}}
+.family-photo-panel {{
+    width:188px;
+    height:152px;
+    border-radius:22px;
+    background:#eee;
+    overflow:hidden;
+    position:relative;
+    z-index:2;
+    box-shadow:0 16px 30px rgba(0,0,0,.11);
+}}
+.family-photo-panel img,
+.family-recent-photo-wrap img,
+.family-playlist-cover img {{
+    width:100%;
+    height:100%;
+    object-fit:cover;
+    display:block;
+}}
+.family-record {{
+    width:150px;
+    height:150px;
+    border-radius:50%;
+    margin-left:-34px;
+    background:radial-gradient(circle, #f46b32 0 18%, #111 19% 55%, #050505 56% 100%);
+    box-shadow:inset 10px 10px 22px rgba(255,255,255,.06), 0 18px 28px rgba(0,0,0,.16);
+}}
+.family-today-copy {{
+    display:grid;
+    grid-template-columns:1fr auto;
+    gap:14px;
+    align-items:end;
+    margin-top:6px;
+}}
+.family-today-label {{
+    color:#ef5a28;
+    font-size:12px;
+    font-weight:1000;
+    margin-bottom:7px;
+}}
+.family-today-title {{
+    font-size:24px;
+    line-height:1.18;
+    font-weight:1000;
+    white-space:nowrap;
+    overflow:hidden;
+    text-overflow:ellipsis;
+}}
+.family-today-meta {{
+    margin-top:8px;
+    color:#8c817a;
+    font-size:12px;
+    line-height:1.35;
+    font-weight:800;
+}}
+.family-play-button {{
+    height:48px;
+    padding:0 22px;
+    border-radius:999px;
+    background:#111;
+    color:#fff !important;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    font-size:14px;
+    font-weight:1000;
+    box-shadow:0 14px 26px rgba(0,0,0,.18);
+    white-space:nowrap;
+}}
+.family-scroll-row {{
+    display:flex;
+    gap:14px;
+    overflow-x:auto;
+    padding:2px 4px 12px 2px;
+    scrollbar-width:none;
+}}
+.family-scroll-row::-webkit-scrollbar {{ display:none; }}
+.family-recent-card {{
+    flex:0 0 142px;
+    border-radius:22px;
+    background:#fff;
+    box-shadow:0 16px 30px rgba(0,0,0,.07);
+    padding:10px;
+}}
+.family-recent-photo-wrap {{
+    height:110px;
+    border-radius:17px;
+    background:#eee;
+    overflow:hidden;
+}}
+.family-recent-title {{
+    margin-top:10px;
+    font-size:14px;
+    line-height:1.2;
+    font-weight:1000;
+    white-space:nowrap;
+    overflow:hidden;
+    text-overflow:ellipsis;
+}}
+.family-recent-meta,
+.family-recent-track,
+.family-playlist-meta,
+.family-playlist-track {{
+    color:#918984;
+    font-size:11px;
+    line-height:1.35;
+    white-space:nowrap;
+    overflow:hidden;
+    text-overflow:ellipsis;
+}}
+.family-recent-track {{ margin-top:5px; }}
+.family-share-card {{
+    border-radius:24px;
+    background:#fff;
+    box-shadow:0 16px 34px rgba(0,0,0,.07);
+    padding:14px;
+}}
+.family-member {{
+    min-height:52px;
+    display:flex;
+    align-items:center;
+    gap:12px;
+    border-bottom:1px solid #f0ebe7;
+}}
+.family-member:last-child {{ border-bottom:0; }}
+.family-avatar {{
+    width:36px;
+    height:36px;
+    border-radius:50%;
+    background:#f5f1ee;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    font-size:13px;
+    font-weight:1000;
+}}
+.family-avatar.active {{
+    background:#111;
+    color:#fff;
+}}
+.family-member-name {{
+    font-size:13px;
+    font-weight:1000;
+}}
+.family-member-status {{
+    margin-top:3px;
+    color:#8e857f;
+    font-size:11px;
+    font-weight:800;
+}}
+.family-playlist-list {{
+    display:grid;
+    gap:12px;
+}}
+.family-playlist-card {{
+    min-height:84px;
+    border-radius:22px;
+    background:#fff;
+    box-shadow:0 16px 30px rgba(0,0,0,.065);
+    padding:10px 12px 10px 10px;
+    display:grid;
+    grid-template-columns:70px 1fr;
+    gap:14px;
+    align-items:center;
+}}
+.family-playlist-cover {{
+    width:70px;
+    height:64px;
+    border-radius:17px;
+    background:#eee;
+    overflow:hidden;
+    position:relative;
+}}
+.family-playlist-cover span {{
+    position:absolute;
+    right:7px;
+    bottom:7px;
+    width:18px;
+    height:18px;
+    border-radius:50%;
+    background:#111;
+    box-shadow:inset 0 0 0 5px #ef5a28;
+}}
+.family-playlist-title {{
+    font-size:15px;
+    line-height:1.2;
+    font-weight:1000;
+    white-space:nowrap;
+    overflow:hidden;
+    text-overflow:ellipsis;
+}}
+.family-empty {{
+    border-radius:22px;
+    background:rgba(255,255,255,.72);
+    padding:30px 18px;
+    text-align:center;
+    color:#8e857f;
+    font-size:14px;
+    line-height:1.55;
+    font-weight:800;
+}}
+.family-photo-placeholder {{
+    width:100%;
+    height:100%;
+    background:linear-gradient(135deg, #f1ede9, #fff8f2);
+    color:#a09790;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    font-size:12px;
+    font-weight:900;
+}}
+.family-bottom-nav {{
+    position:sticky;
+    bottom:16px;
+    z-index:5;
+    margin:26px 12px 0;
+    min-height:66px;
+    border-radius:999px;
+    background:rgba(255,255,255,.92);
+    box-shadow:0 18px 42px rgba(0,0,0,.14);
+    display:grid;
+    grid-template-columns:repeat(4, 1fr);
+    align-items:center;
+    backdrop-filter:blur(10px);
+}}
+.family-nav-item {{
+    min-width:0;
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+    justify-content:center;
+    gap:4px;
+    color:#8f8580 !important;
+    font-size:10px;
+    font-weight:1000;
+}}
+.family-nav-item span {{
+    font-size:8px;
+    line-height:1;
+    letter-spacing:.4px;
+}}
+.family-nav-item.active {{
+    color:#111 !important;
+}}
+@media (min-width:760px) {{
+    .block-container {{
+        border-radius:34px;
+        margin-top:22px !important;
+        box-shadow:0 24px 64px rgba(0,0,0,.10);
+    }}
+}}
+@media (max-width:520px) {{
+    .block-container {{ padding:16px 14px 24px !important; }}
+    .family-today-copy {{ grid-template-columns:1fr; }}
+    .family-play-button {{ width:100%; }}
+    .family-art-row {{ height:170px; }}
+    .family-photo-panel {{ width:170px; height:138px; }}
+    .family-record {{ width:134px; height:134px; }}
+}}
+</style>
+<div class="family-shell">
+  <div class="family-top">
+    <div class="family-logo">{HOME_LOGO_HTML}</div>
+    <div class="family-top-icons">
+      <div class="family-icon">!</div>
+      <div class="family-icon">박</div>
+    </div>
+  </div>
+  <div class="family-greeting">
+    <h1>안녕하세요, 박일성님</h1>
+    <p>오늘도 리플레이와 함께해요</p>
+  </div>
+
+  <div class="family-section-head">
+    <div class="family-section-title">오늘의 플레이리스트</div>
+    <div class="family-section-count">{total_count}개의 추억</div>
+  </div>
+  <section class="family-today-card">
+    <div class="family-art-row">
+      <div class="family-photo-panel">{latest_photo}</div>
+      <div class="family-record"></div>
+    </div>
+    <div class="family-today-copy">
+      <div>
+        <div class="family-today-label">Shared Memory</div>
+        <div class="family-today-title">{latest_title}</div>
+        <div class="family-today-meta">{latest_count_text}<br>{latest_track}</div>
+      </div>
+      <a class="family-play-button" href="{latest_href}" target="_self">재생하기</a>
+    </div>
+  </section>
+
+  <div class="family-section-head">
+    <div class="family-section-title">최근 재생</div>
+    <div class="family-section-count">가족이 함께 보는 중</div>
+  </div>
+  {recent_html}
+
+  <div id="family-members" class="family-section-head">
+    <div class="family-section-title">가족과 공유 중</div>
+    <div class="family-section-count">4명</div>
+  </div>
+  <section class="family-share-card">
+    {members_html}
+  </section>
+
+  <div class="family-section-head">
+    <div class="family-section-title">추천 플레이리스트</div>
+    <div class="family-section-count">카테고리별</div>
+  </div>
+  {playlist_html}
+
+  <nav class="family-bottom-nav">
+    <a class="family-nav-item active" href="?action=family_home" target="_self"><span>HOME</span>홈</a>
+    <a class="family-nav-item" href="#" target="_self"><span>SEARCH</span>검색</a>
+    <a class="family-nav-item" href="?action=family_music" target="_self"><span>MUSIC</span>내 음악</a>
+    <a class="family-nav-item" href="#family-members" target="_self"><span>FAMILY</span>가족</a>
+  </nav>
+</div>
+""")
+
+elif False and page == "home":
+    home_memories = load_memories()
+    memory_count = len(home_memories)
+    current_tab = st.session_state.get("home_tab", "album")
+    active_album = current_tab == "album"
+    active_music = current_tab == "music"
+    active_album_color = "#ff4b16" if active_album else "#555"
+    active_music_color = "#ff4b16" if active_music else "#555"
+    album_underline = "#ff4b16" if active_album else "transparent"
+    music_underline = "#ff4b16" if active_music else "transparent"
+    html(f"""
+<style>
+.stApp {{ background:#efefef !important; }}
+.block-container {{
+    max-width:980px !important;
+    min-height:690px !important;
+    margin:0 auto !important;
+    padding:32px 34px 118px !important;
+    background:
+      radial-gradient(circle at 55% 0%, rgba(255,119,54,.25), transparent 30%),
+      linear-gradient(180deg, #fff7f2 0%, #f4f4f4 38%, #f7f7f7 100%) !important;
+    overflow:hidden !important;
+    position:relative !important;
+}}
+header, [data-testid="stToolbar"], [data-testid="stDecoration"], #MainMenu, footer {{ display:none !important; }}
+div[data-testid="stVerticalBlock"] {{ gap:.55rem !important; }}
+.home-top {{ display:flex; align-items:flex-start; justify-content:space-between; margin-bottom:30px; }}
+.home-logo {{ font-size:18px; font-weight:1000; letter-spacing:-1px; line-height:.82; }}
+.home-logo small {{ display:block; font-size:6px; letter-spacing:4px; margin-top:5px; }}
+.home-search {{ width:126px; height:46px; border-radius:999px; background:#fff; box-shadow:0 12px 30px rgba(0,0,0,.08); display:flex; align-items:center; justify-content:flex-end; padding-right:25px; }}
+.home-search::before {{ content:""; width:14px; height:14px; border:3px solid #111; border-radius:50%; display:block; }}
+.home-search::after {{ content:""; width:9px; height:3px; background:#111; transform:rotate(45deg) translate(-1px, 9px); border-radius:99px; display:block; margin-left:-3px; }}
+.home-title-row {{ display:flex; align-items:end; justify-content:space-between; margin:0 42px 12px; }}
+.home-title {{ font-size:32px; font-weight:1000; letter-spacing:-1px; }}
+.home-count {{ font-size:17px; font-weight:700; color:#444; padding-bottom:6px; }}
+.home-divider {{ height:1px; background:#d6d6d6; margin:0 42px 28px; }}
+.st-key-home_tab_album button,
+.st-key-home_tab_music button {{
+    height:44px !important;
+    min-height:44px !important;
+    padding:0 4px !important;
+    border:0 !important;
+    border-radius:0 !important;
+    background:transparent !important;
+    font-size:18px !important;
+    font-weight:1000 !important;
+}}
+.st-key-home_tab_album button {{ color:{active_album_color} !important; box-shadow:inset 0 -3px 0 {album_underline} !important; }}
+.st-key-home_tab_music button {{ color:{active_music_color} !important; box-shadow:inset 0 -3px 0 {music_underline} !important; }}
+.home-card {{
+    min-height:274px;
+    border-radius:15px;
+    background:#fff;
+    box-shadow:0 16px 30px rgba(0,0,0,.07);
+    padding:9px 9px 14px;
+    overflow:hidden;
+}}
+.home-card-photo {{ height:164px; border-radius:10px; background:#ededed; display:flex; align-items:center; justify-content:center; overflow:hidden; color:#8a8a8a; font-size:22px; }}
+.home-card-photo img {{ width:100%; height:100%; object-fit:cover; display:block; }}
+.home-card-title {{ margin:15px 7px 0; font-size:16px; line-height:1.25; font-weight:900; color:#111; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
+.home-card-note {{ margin:15px 7px 0; font-size:12px; line-height:1.4; color:#777; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
+.home-add-card {{ min-height:274px; border-radius:15px; background:rgba(255,255,255,.72); border:2px dashed rgba(0,0,0,.08); display:flex; align-items:center; justify-content:center; color:#222; font-size:42px; font-weight:300; box-shadow:0 16px 30px rgba(0,0,0,.04); }}
+.home-empty {{ min-height:250px; display:flex; flex-direction:column; align-items:center; justify-content:center; color:#777; font-size:15px; text-align:center; }}
+.home-music-card {{ border-radius:15px; background:#fff; box-shadow:0 16px 30px rgba(0,0,0,.07); padding:14px; min-height:265px; }}
+.home-music-cover {{ width:100%; aspect-ratio:1/1; border-radius:10px; background:#eee; overflow:hidden; display:flex; align-items:center; justify-content:center; color:#999; font-size:24px; }}
+.home-music-cover img {{ width:100%; height:100%; object-fit:cover; display:block; }}
+.home-music-title {{ margin-top:12px; font-size:17px; font-weight:1000; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
+.home-music-artist {{ margin-top:5px; font-size:13px; color:#777; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
+.home-music-link {{ margin-top:8px; font-size:12px; color:#ef5a28; font-weight:900; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
+.st-key-home_open_0 button, .st-key-home_open_1 button, .st-key-home_open_2 button, .st-key-home_open_3 button, .st-key-home_open_4 button, .st-key-home_open_5 button,
+.st-key-home_open_6 button, .st-key-home_open_7 button, .st-key-home_open_8 button, .st-key-home_open_9 button, .st-key-home_open_10 button, .st-key-home_open_11 button,
+.st-key-home_open_12 button, .st-key-home_open_13 button, .st-key-home_open_14 button, .st-key-home_open_15 button,
+.st-key-home_music_edit_0 button, .st-key-home_music_edit_1 button, .st-key-home_music_edit_2 button, .st-key-home_music_edit_3 button, .st-key-home_music_edit_4 button, .st-key-home_music_edit_5 button,
+.st-key-home_add_button button, .st-key-home_music_add_button button {{
+    height:38px !important;
+    border-radius:999px !important;
+    background:#111 !important;
+    color:#fff !important;
+    box-shadow:0 10px 18px rgba(0,0,0,.10) !important;
+    font-weight:900 !important;
+}}
+.st-key-home_edit_0 button, .st-key-home_edit_1 button, .st-key-home_edit_2 button, .st-key-home_edit_3 button, .st-key-home_edit_4 button, .st-key-home_edit_5 button,
+.st-key-home_edit_6 button, .st-key-home_edit_7 button, .st-key-home_edit_8 button, .st-key-home_edit_9 button, .st-key-home_edit_10 button, .st-key-home_edit_11 button,
+.st-key-home_edit_12 button, .st-key-home_edit_13 button, .st-key-home_edit_14 button, .st-key-home_edit_15 button {{
+    height:38px !important;
+    width:48px !important;
+    border-radius:10px !important;
+    background:#333 !important;
+    color:#fff !important;
+    box-shadow:none !important;
+    font-size:16px !important;
+}}
+.st-key-home_music_delete_0 button, .st-key-home_music_delete_1 button, .st-key-home_music_delete_2 button, .st-key-home_music_delete_3 button, .st-key-home_music_delete_4 button, .st-key-home_music_delete_5 button {{
+    height:38px !important;
+    border-radius:999px !important;
+    background:#fff !important;
+    color:#d94a35 !important;
+    border:1px solid rgba(217,74,53,.25) !important;
+    box-shadow:0 8px 16px rgba(0,0,0,.06) !important;
+}}
+.st-key-home_record_footer, .st-key-home_play_footer {{ position:fixed !important; bottom:54px !important; z-index:30 !important; width:360px !important; }}
+.st-key-home_record_footer {{ left:calc(50vw - 430px) !important; }}
+.st-key-home_play_footer {{ right:calc(50vw - 430px) !important; }}
+.st-key-home_record_footer button, .st-key-home_play_footer button {{ height:64px !important; border-radius:22px !important; font-size:20px !important; font-weight:1000 !important; box-shadow:0 14px 30px rgba(0,0,0,.12) !important; }}
+.st-key-home_record_footer button {{ background:#111 !important; color:#fff !important; }}
+.st-key-home_play_footer button {{ background:#fff !important; color:#111 !important; }}
+@media (max-width:900px) {{
+    .block-container {{ max-width:820px !important; padding:28px 26px 112px !important; }}
+    .home-title-row, .home-divider {{ margin-left:28px; margin-right:28px; }}
+    .st-key-home_record_footer, .st-key-home_play_footer {{ position:static !important; width:auto !important; }}
+}}
+</style>
+<div class="home-top">
+  <div class="home-logo">Re:Play<small>MEMORY</small></div>
+  <div class="home-search"></div>
+</div>
+<div class="home-title-row">
+  <div class="home-title">우리 가족</div>
+  <div class="home-count">{memory_count}장의 추억 보관중</div>
+</div>
+""")
+    tab_left, tab_mid, tab_fill = st.columns([0.08, 0.08, 0.84])
+    with tab_left:
+        if st.button("앨범", key="home_tab_album"):
+            st.session_state.home_tab = "album"
+            st.rerun()
+    with tab_mid:
+        if st.button("음악", key="home_tab_music"):
+            st.session_state.home_tab = "music"
+            st.rerun()
+    html('<div class="home-divider"></div>')
+
+    if current_tab == "album":
+        if not home_memories:
+            html('<div class="home-empty">아직 저장된 추억이 없어요.<br>아래 버튼으로 첫 기억을 기록해보세요.</div>')
+        card_items = home_memories[:15] + [None]
+        for row_start in range(0, len(card_items), 3):
+            cols = st.columns(3, gap="large")
+            for offset, memory in enumerate(card_items[row_start:row_start + 3]):
+                index = row_start + offset
+                with cols[offset]:
+                    if memory is None:
+                        html('<div class="home-add-card">+</div>')
+                        if st.button("새 기억 추가", key="home_add_button", use_container_width=True):
+                            reset_flow()
+                            go("scan_upload")
+                        continue
+                    photo_src = image_src(photo_path_for_memory(memory))
+                    photo_html = f'<img src="{escape(photo_src, quote=True)}">' if photo_src else '<span>▧</span>'
+                    title = escape(memory_title(memory))
+                    preview = escape(memory_note_preview(memory))
+                    html(f"""
+<div class="home-card">
+  <div class="home-card-photo">{photo_html}</div>
+  <div class="home-card-title">{title}</div>
+  <div class="home-card-note">{preview}</div>
+</div>
+""")
+                    open_col, edit_col = st.columns([0.78, 0.22], gap="small")
+                    with open_col:
+                        if st.button("카드 열기", key=f"home_open_{index}", use_container_width=True):
+                            open_memory_from_home(memory.get("id"))
+                            st.rerun()
+                    with edit_col:
+                        if st.button("✎", key=f"home_edit_{index}", use_container_width=True):
+                            open_memory_edit(memory.get("id"))
+                            st.rerun()
+    else:
+        music_memories = [memory for memory in home_memories if memory.get("selected_track")]
+        if not music_memories:
+            html('<div class="home-empty">아직 연결된 음악이 없어요.<br>기억을 기록하면서 음악을 골라보세요.</div>')
+            if st.button("음악 추가하기", key="home_music_add_button", use_container_width=True):
+                reset_flow()
+                go("music")
+        for row_start in range(0, len(music_memories), 3):
+            cols = st.columns(3, gap="large")
+            for offset, memory in enumerate(music_memories[row_start:row_start + 3]):
+                index = row_start + offset
+                track = memory.get("selected_track") or {}
+                cover_src = track.get("image") or ""
+                cover_html = f'<img src="{escape(cover_src, quote=True)}">' if cover_src else '<span>♪</span>'
+                title = escape(track.get("title") or "노래 제목")
+                artist = escape(track.get("artist") or "가수")
+                linked_title = escape(memory_title(memory))
+                with cols[offset]:
+                    html(f"""
+<div class="home-music-card">
+  <div class="home-music-cover">{cover_html}</div>
+  <div class="home-music-title">{title}</div>
+  <div class="home-music-artist">{artist}</div>
+  <div class="home-music-link">{linked_title}</div>
+</div>
+""")
+                    audio_source = track.get("file") or track.get("preview_url")
+                    if audio_source:
+                        st.audio(audio_source)
+                    edit_col, delete_col = st.columns(2)
+                    with edit_col:
+                        if st.button("수정", key=f"home_music_edit_{index}", use_container_width=True):
+                            open_music_edit(memory.get("id"))
+                            st.rerun()
+                    with delete_col:
+                        if st.button("삭제", key=f"home_music_delete_{index}", use_container_width=True):
+                            clear_memory_track(memory.get("id"))
+                            st.rerun()
+
+    footer_record, footer_play = st.columns(2)
+    with footer_record:
+        if st.button("기억 기록하기", key="home_record_footer", use_container_width=True):
+            reset_flow()
+            go("scan_upload")
+    with footer_play:
+        if st.button("추억 재생하기", key="home_play_footer", use_container_width=True):
+            if home_memories:
+                picked = home_memories[0]
+                categories = memory_categories(picked)
+                open_category_album(categories[0] if categories else "", picked.get("id"))
+                st.rerun()
+            reset_flow()
+            go("scan_upload")
+
+elif page == "memory_edit":
+    edit_id = st.session_state.get("editing_memory_id") or st.session_state.get("selected_memory_id")
+    edit_memory = next((memory for memory in load_memories() if memory.get("id") == edit_id), None)
+    if not edit_memory:
+        st.session_state.page = "home"
+        st.rerun()
+    photo_src = image_src(photo_path_for_memory(edit_memory))
+    photo_html = f'<img src="{escape(photo_src, quote=True)}">' if photo_src else '<span>▧</span>'
+    edit_categories = memory_categories(edit_memory)
+    html("""
+<style>
+.stApp { background:#efefef !important; }
+.block-container {
+    max-width:820px !important;
+    min-height:560px !important;
+    margin:20px auto 0 !important;
+    padding:34px 46px !important;
+    background:radial-gradient(circle at 84% 0%, rgba(255,119,54,.20), transparent 32%), #fffaf7 !important;
+    overflow:hidden !important;
+}
+header, [data-testid="stToolbar"], [data-testid="stDecoration"], #MainMenu, footer { display:none !important; }
+.edit-head { display:flex; align-items:center; justify-content:space-between; margin-bottom:22px; }
+.edit-title { font-size:26px; font-weight:1000; }
+.edit-layout { display:grid; grid-template-columns:270px 1fr; gap:28px; align-items:start; }
+.edit-photo { height:220px; border-radius:16px; background:#eee; display:flex; align-items:center; justify-content:center; overflow:hidden; box-shadow:0 12px 24px rgba(0,0,0,.07); }
+.edit-photo img { width:100%; height:100%; object-fit:cover; display:block; }
+.edit-hint { margin-top:14px; color:#777; font-size:12px; line-height:1.5; }
+.edit-form-card { border-radius:18px; background:#fff; box-shadow:0 14px 32px rgba(0,0,0,.08); padding:18px; }
+.edit-form-card label { font-size:13px !important; font-weight:900 !important; color:#111 !important; }
+.edit-form-card input, .edit-form-card textarea { border:0 !important; border-radius:12px !important; background:#f5f6f7 !important; box-shadow:none !important; font-size:15px !important; }
+.st-key-edit_save_button button { background:#111 !important; color:#fff !important; height:48px !important; border-radius:999px !important; }
+.st-key-edit_delete_button button { background:#fff !important; color:#d94a35 !important; height:48px !important; border-radius:999px !important; border:1px solid rgba(217,74,53,.24) !important; }
+</style>
+<div class="edit-head"><div class="edit-title">추억 수정하기</div></div>
+""")
+    html(f"""
+<div class="edit-layout">
+  <div>
+    <div class="edit-photo">{photo_html}</div>
+    <div class="edit-hint">사진은 그대로 두고 제목, 기록, 카테고리만 수정할 수 있어요.</div>
+  </div>
+  <div class="edit-form-card">
+""")
+    title_value = st.text_input("제목", value=str(edit_memory.get("title") or ""), key=f"edit_title_{edit_id}")
+    note_value = st.text_area("기록 내용", value=str(edit_memory.get("note") or ""), key=f"edit_note_{edit_id}", height=140)
+    category_value = st.text_input(
+        "카테고리",
+        value=", ".join(edit_categories),
+        key=f"edit_category_{edit_id}",
+        help="여러 개면 쉼표로 나눠 적어주세요.",
+    )
+    html("</div></div>")
+    save_col, delete_col = st.columns(2)
+    with save_col:
+        if st.button("저장하기", key="edit_save_button", use_container_width=True):
+            categories = parse_category_text(category_value)
+            edit_memory["title"] = title_value.strip()
+            edit_memory["note"] = note_value
+            edit_memory["categories"] = categories
+            edit_memory["category"] = ", ".join(categories)
+            save_memory_record(edit_memory)
+            st.session_state.play_memory = edit_memory
+            st.session_state.selected_memory_id = edit_id
+            st.session_state.page = "home"
+            st.rerun()
+    with delete_col:
+        if st.button("삭제하기", key="edit_delete_button", use_container_width=True):
+            delete_memory(edit_id)
+            st.session_state.editing_memory_id = None
+            st.session_state.page = "home"
+            st.rerun()
 
 elif page == "scan_upload":
     photo = photo_markup()
     memory_query = f"&memory={st.session_state.memory_id}" if st.session_state.memory_id else ""
     html(f"""
 <div class="app-card flow">
-  <div class="topbar"><a class="back" href="?action=back" target="_self">‹</a><div class="center"></div><div class="guide">가이드</div></div>
+  <div class="topbar"><a class="back" href="?action=back" target="_self">‹</a><div class="center">{FLOW_LOGO_HTML}</div><div class="guide">가이드</div></div>
   <div class="scan-card"><div class="scan-frame">{photo if st.session_state.photo_path else '사진을 스캔 공간에 넣어주세요'}</div></div>
   <div class="down-mark">⌄</div>
   <a class="black-pill" href="?action=scan_start{memory_query}" target="_self">스캔 시작하기</a>
@@ -978,7 +2585,7 @@ elif page == "scan_running":
         photo = photo_markup("photo-fill scan-blur")
         progress_area.markdown(f"""
 <div class="app-card flow">
-  <div class="topbar"><a class="back" href="?action=back" target="_self">‹</a><div class="center"></div><div class="guide">가이드</div></div>
+  <div class="topbar"><a class="back" href="?action=back" target="_self">‹</a><div class="center">{FLOW_LOGO_HTML}</div><div class="guide">가이드</div></div>
   <div class="scan-card"><div class="scan-frame">{photo}<div class="scan-line live" style="--scan-y:{percent}%"></div><div class="scan-label">스캔중...</div></div></div>
   <div class="scan-progress-row"><div class="scan-progress-track"><div class="scan-progress-fill" style="width:{percent}%"></div></div><div>{percent}%</div></div>
   <div class="down-mark">⌄</div>
@@ -995,7 +2602,7 @@ elif page == "analyzing":
     k1, k2, k3 = st.session_state.keywords
     html(f"""
 <div class="app-card flow">
-  <div class="topbar"><a class="back" href="?action=back" target="_self">‹</a><div class="center"></div><div class="guide">가이드</div></div>
+  <div class="topbar"><a class="back" href="?action=back" target="_self">‹</a><div class="center">{FLOW_LOGO_HTML}</div><div class="guide">가이드</div></div>
   <div class="analysis-wrap">
     <div class="photo-paper">
       {img}
@@ -1023,7 +2630,7 @@ elif page == "scan_done":
     )
     html(f"""
 <div class="app-card flow">
-  <div class="topbar"><a class="back" href="?action=back" target="_self">‹</a><div class="center"></div><div class="guide">가이드</div></div>
+  <div class="topbar"><a class="back" href="?action=back" target="_self">‹</a><div class="center">{FLOW_LOGO_HTML}</div><div class="guide">가이드</div></div>
   <div class="done-grid">
     <div>
       <div class="done-title">사진 스캔이 완료되었어요!</div>
@@ -1282,10 +2889,10 @@ div[data-testid="stHorizontalBlock"]:has(iframe[title*="streamlit_drawable_canva
 
     write_mode = st.session_state.write_mode
 
-    html('''
+    html(f'''
 <div class="write-topbar">
   <div></div>
-  <div class="write-handle"></div>
+  <div>{FLOW_LOGO_HTML}</div>
   <div class="mode-link-row"></div>
 </div>
 ''')
@@ -1438,6 +3045,13 @@ div[data-testid="stHorizontalBlock"] { gap: 1.25rem !important; }
     color:#0b67b2; font-size:23px; font-weight:900; text-decoration:none;
     margin: 0 0 12px 0;
 }
+.music-logo-row {
+    height:38px;
+    display:flex;
+    align-items:flex-start;
+    justify-content:center;
+    margin:0 0 12px 0;
+}
 .music-photo-box {
     width:100%; height:188px; background:#ffffff; overflow:hidden;
     display:flex; align-items:center; justify-content:center; color:#6a8396; font-size:24px;
@@ -1526,7 +3140,7 @@ div[data-testid="stAudio"] { margin: 6px 0 10px !important; }
 </style>
 """, unsafe_allow_html=True)
 
-    st.markdown('<a class="music-back" href="?action=back" target="_self">‹</a>', unsafe_allow_html=True)
+    st.markdown(f'<div class="music-logo-row">{FLOW_LOGO_HTML}</div>', unsafe_allow_html=True)
 
     left_col, right_col = st.columns([0.45, 0.55], gap="large")
 
