@@ -1,6 +1,7 @@
-import base64
+﻿import base64
 import json
 import os
+import re
 import time
 import uuid
 from datetime import datetime
@@ -124,6 +125,8 @@ DEFAULTS = {
     "selected_track": None,
     "spotify_tracks": [],
     "spotify_query": "",
+    "music_search_results": [],
+    "music_last_search_query": "",
     "music_show_more": False,
     "play_memory": None,
     "selected_memory_id": None,
@@ -133,7 +136,17 @@ DEFAULTS = {
     "memory_text": "",
     "handwriting_path": None,
     "handwriting_json": None,
-    "write_mode": "chat",
+    "handwriting_image_data": None,
+    "write_mode": "handwriting",
+    "current_question_index": 0,
+    "question_answers": {},
+    "write_completed": False,
+    "pen_color": "#000000",
+    "pen_width": 3,
+    "stroke_width": 3,
+    "drawing_tool": "pen",
+    "canvas_revision": 0,
+    "handwriting_redo_stack": [],
     "analysis_done": False,
     "analysis_label": "사진 속 순간",
     "suggested_categories": [],
@@ -149,9 +162,19 @@ DEFAULTS = {
     "selected_categories": [],
     "home_tab": "album",
     "home_playing_memory_id": None,
+    "playback_memories": [],
+    "playback_index": 0,
+    "playback_started_at": 0.0,
+    "playback_caption_index": 0,
+    "playback_caption_started_at": 0.0,
+    "playback_song_index": 0,
+    "playback_song_started_at": 0.0,
     "editing_memory_id": None,
     "edit_mode": "create",
     "music_return_page": "home",
+    "scan_upload_notice": "",
+    "nfc_uid": "",
+    "nfc_label": "RE:01",
 }
 
 for key, value in DEFAULTS.items():
@@ -164,6 +187,77 @@ def go(page):
     st.rerun()
 
 
+def normalize_nfc_label(value="RE01"):
+    """Convert NFC UID/text into the visible category name.
+
+    Examples:
+    - RE01 -> RE:01
+    - RE:01 -> RE:01
+    - RE02 -> RE:02
+    """
+    raw = str(value or "RE01").strip().upper().replace(" ", "")
+    if raw.startswith("RE:"):
+        suffix = raw.split(":", 1)[1] or "01"
+        return f"RE:{suffix.zfill(2) if suffix.isdigit() else suffix}"
+    if raw.startswith("RE") and len(raw) > 2:
+        suffix = raw[2:] or "01"
+        return f"RE:{suffix.zfill(2) if suffix.isdigit() else suffix}"
+    return raw or "RE:01"
+
+
+def current_nfc_category():
+    return normalize_nfc_label(st.session_state.get("nfc_label") or st.session_state.get("nfc_uid") or "RE01")
+
+
+def set_current_nfc_category(label):
+    label = normalize_nfc_label(label)
+    st.session_state.nfc_label = label
+    st.session_state.album_category = label
+    st.session_state.selected_category = label
+    st.session_state.selected_categories = [label]
+    return label
+
+
+def memory_nfc_category(memory):
+    """Return the NFC album/category this memory belongs to.
+
+    Old memories that do not have NFC metadata are treated as RE:01 so they
+    still appear in the first cassette during demos.
+    """
+    memory = memory or {}
+    explicit = memory.get("nfc_label") or memory.get("nfc_category") or memory.get("nfc_uid")
+    if explicit:
+        return normalize_nfc_label(explicit)
+
+    for category in memory_categories(memory):
+        if str(category).strip().upper().replace(" ", "").startswith("RE"):
+            return normalize_nfc_label(category)
+
+    return "RE:01"
+
+
+def memory_belongs_to_current_nfc(memory, label=None):
+    label = normalize_nfc_label(label or current_nfc_category())
+    return memory_nfc_category(memory) == label
+
+
+def memories_for_current_nfc(source_memories=None, label=None):
+    label = normalize_nfc_label(label or current_nfc_category())
+    source = source_memories if source_memories is not None else load_memories()
+    return [memory for memory in source if memory_belongs_to_current_nfc(memory, label)]
+
+
+def handle_nfc_detected(uid="RE01"):
+    label = normalize_nfc_label(uid)
+    st.session_state["nfc_uid"] = str(uid or label)
+    set_current_nfc_category(label)
+    st.session_state["selected_memory_id"] = None
+    st.session_state["album_selected_memory_id"] = None
+    st.session_state["play_memory"] = None
+    st.session_state["home_tab"] = "album"
+    st.session_state["page"] = "nfc_recognized"
+
+
 def set_previous_page():
     current = st.session_state.get("page", "home")
     if current == "write":
@@ -174,23 +268,16 @@ def set_previous_page():
         st.session_state.page = "scan_upload"
     elif current == "write":
         st.session_state.page = "scan_done"
+    elif current == "memory_done":
+        st.session_state.page = "write"
     elif current == "music":
         if st.session_state.get("edit_mode") == "music_edit":
             finish_existing_music_edit()
         else:
             st.session_state.page = "write"
-    elif current in ("category_loading", "category_edit"):
-        st.session_state.page = "music"
-    elif current == "album_done":
-        st.session_state.page = "category_edit"
-    elif current == "nfc_scan":
-        st.session_state.page = "album_done"
-    elif current == "nfc_done":
-        st.session_state.page = "nfc_scan"
-    elif current == "video":
-        st.session_state.page = "album_done"
-    elif current in ("player", "player_legacy"):
-        st.session_state.page = "video"
+    elif current in ("category_loading", "category_edit", "album_done", "nfc_scan", "nfc_done", "video", "player", "player_legacy"):
+        # 현재 버전에서는 카테고리/앨범완료/재생 화면을 사용하지 않음
+        st.session_state.page = "home"
     elif current == "memory_edit":
         st.session_state.page = "home"
     else:
@@ -208,6 +295,8 @@ def reset_flow():
     st.session_state.selected_track = None
     st.session_state.spotify_tracks = []
     st.session_state.spotify_query = ""
+    st.session_state.music_search_results = []
+    st.session_state.music_last_search_query = ""
     st.session_state.music_show_more = False
     st.session_state.play_memory = None
     st.session_state.album_category = ""
@@ -216,7 +305,19 @@ def reset_flow():
     st.session_state.memory_text = ""
     st.session_state.handwriting_path = None
     st.session_state.handwriting_json = None
-    st.session_state.write_mode = "chat"
+    st.session_state.handwriting_image_data = None
+    st.session_state.write_mode = "handwriting"
+    st.session_state.current_question_index = 0
+    st.session_state.question_answers = {}
+    for index in range(3):
+        st.session_state.pop(f"question_answer_{index}", None)
+    st.session_state.write_completed = False
+    st.session_state.pen_color = "#000000"
+    st.session_state.pen_width = 3
+    st.session_state.stroke_width = 3
+    st.session_state.drawing_tool = "pen"
+    st.session_state.canvas_revision = 0
+    st.session_state.handwriting_redo_stack = []
     st.session_state.analysis_done = False
     st.session_state.analysis_label = "사진 속 순간"
     st.session_state.suggested_categories = []
@@ -228,12 +329,61 @@ def reset_flow():
         "사진 속 사람들과 어떤 추억이 있나요?",
         "이 장면을 보면 가장 먼저 떠오르는 감정은 무엇인가요?",
     ]
-    st.session_state.selected_category = ""
-    st.session_state.selected_categories = []
+    current_category = current_nfc_category()
+    st.session_state.album_category = current_category
+    st.session_state.selected_category = current_category
+    st.session_state.selected_categories = [current_category]
     st.session_state.home_playing_memory_id = None
+    st.session_state.playback_memories = []
+    st.session_state.playback_index = 0
+    st.session_state.playback_started_at = 0.0
+    st.session_state.playback_caption_index = 0
+    st.session_state.playback_caption_started_at = 0.0
+    st.session_state.playback_song_index = 0
+    st.session_state.playback_song_started_at = 0.0
     st.session_state.editing_memory_id = None
     st.session_state.edit_mode = "create"
     st.session_state.music_return_page = "home"
+    st.session_state.scan_upload_notice = ""
+
+
+def reset_scan_inputs():
+    st.session_state.photo_path = None
+    st.session_state.memory_id = None
+    st.session_state.upload_signature = None
+    st.session_state.selected_track = None
+    st.session_state.spotify_tracks = []
+    st.session_state.spotify_query = ""
+    st.session_state.music_search_results = []
+    st.session_state.music_last_search_query = ""
+    st.session_state.music_show_more = False
+    st.session_state.memory_text = ""
+    st.session_state.analysis_done = False
+    st.session_state.analysis_label = "사진 속 순간"
+    st.session_state.suggested_categories = []
+    st.session_state.music_query = ""
+    st.session_state.keywords = ["추억사진", "인물사진", "옛날 분위기"]
+    st.session_state.question = "이 사진을 찍던 날은 어떤 날이었나요?"
+    st.session_state.questions = [
+        "이 사진을 찍던 날은 어떤 날이었나요?",
+        "사진 속 사람들과 어떤 추억이 있나요?",
+        "이 장면을 보면 가장 먼저 떠오르는 감정은 무엇인가요?",
+    ]
+    st.session_state.handwriting_path = None
+    st.session_state.handwriting_json = None
+    st.session_state.handwriting_image_data = None
+    st.session_state.current_question_index = 0
+    st.session_state.question_answers = {}
+    for index in range(3):
+        st.session_state.pop(f"question_answer_{index}", None)
+    st.session_state.write_completed = False
+    st.session_state.pen_color = "#000000"
+    st.session_state.pen_width = 3
+    st.session_state.stroke_width = 3
+    st.session_state.drawing_tool = "pen"
+    st.session_state.canvas_revision = 0
+    st.session_state.handwriting_redo_stack = []
+    st.session_state.scan_upload_notice = ""
 
 
 def html(markup):
@@ -263,7 +413,7 @@ FLOW_LOGO_HTML = f'<img class="replay-logo-img flow-logo-img" src="{REPLAY_LOGO_
 
 
 def render_global_back_button():
-    if st.session_state.get("page") in ("splash", "home"):
+    if st.session_state.get("page") in ("splash", "home", "nfc_intro", "nfc_recognized"):
         return
     html("""
 <style>
@@ -335,13 +485,95 @@ def canvas_has_ink(image_data):
 
 def remember_canvas_state(canvas_key):
     canvas_state = st.session_state.get(canvas_key)
-    if isinstance(canvas_state, dict) and canvas_state.get("raw"):
-        st.session_state.handwriting_json = canvas_state["raw"]
+    if not isinstance(canvas_state, dict):
+        return
+    raw_canvas = canvas_state.get("raw") or canvas_state.get("json_data")
+    if isinstance(raw_canvas, str):
+        try:
+            raw_canvas = json.loads(raw_canvas)
+        except Exception:
+            raw_canvas = None
+    if not isinstance(raw_canvas, dict):
+        return
+    objects = raw_canvas.get("objects")
+    existing = st.session_state.get("handwriting_json")
+    existing_objects = existing.get("objects") if isinstance(existing, dict) else []
+    if isinstance(objects, list) and (objects or not existing_objects):
+        st.session_state.handwriting_json = raw_canvas
+        st.session_state.handwriting_json_key = canvas_key
 
 
-def set_pen_color(hex_color, canvas_key):
-    remember_canvas_state(canvas_key)
+def set_pen_color(hex_color, canvas_key=None):
+    if canvas_key:
+        remember_canvas_state(canvas_key)
     st.session_state.pen_color = hex_color
+    st.session_state.drawing_tool = "pen"
+
+
+def set_drawing_tool(tool, canvas_key=None):
+    if canvas_key:
+        remember_canvas_state(canvas_key)
+    st.session_state.drawing_tool = tool
+
+
+def bump_canvas_revision():
+    st.session_state.canvas_revision = int(st.session_state.get("canvas_revision", 0) or 0) + 1
+
+
+def clear_handwriting_canvas():
+    st.session_state.handwriting_json = None
+    st.session_state.handwriting_json_key = None
+    st.session_state.handwriting_image_data = None
+    st.session_state.handwriting_redo_stack = []
+    st.session_state.force_canvas_redraw = True
+    bump_canvas_revision()
+
+
+def write_canvas_key(question_index=None):
+    index = current_question_index() if question_index is None else question_index
+    revision = int(st.session_state.get("canvas_revision", 0) or 0)
+    memory_id = st.session_state.get("memory_id") or "new"
+    return f"handwriting_canvas_{memory_id}_q{index}_r{revision}"
+
+
+def move_write_question(next_index):
+    save_current_question_answer()
+    st.session_state.current_question_index = max(0, min(2, next_index))
+    clear_handwriting_canvas()
+
+
+def undo_handwriting(canvas_key=None):
+    if canvas_key:
+        remember_canvas_state(canvas_key)
+    drawing = st.session_state.get("handwriting_json")
+    if not isinstance(drawing, dict):
+        return
+    objects = drawing.get("objects")
+    if not isinstance(objects, list) or not objects:
+        return
+    redo_stack = st.session_state.get("handwriting_redo_stack")
+    if not isinstance(redo_stack, list):
+        redo_stack = []
+    redo_stack.append(objects.pop())
+    st.session_state.handwriting_redo_stack = redo_stack
+    st.session_state.handwriting_json = drawing
+    st.session_state.force_canvas_redraw = True
+    bump_canvas_revision()
+
+
+def redo_handwriting():
+    drawing = st.session_state.get("handwriting_json")
+    if not isinstance(drawing, dict):
+        drawing = {"version": "5.2.4", "objects": []}
+    objects = drawing.setdefault("objects", [])
+    redo_stack = st.session_state.get("handwriting_redo_stack")
+    if not isinstance(redo_stack, list) or not redo_stack:
+        return
+    objects.append(redo_stack.pop())
+    st.session_state.handwriting_redo_stack = redo_stack
+    st.session_state.handwriting_json = drawing
+    st.session_state.force_canvas_redraw = True
+    bump_canvas_revision()
 
 
 def current_canvas_key():
@@ -360,6 +592,7 @@ def preserve_write_inputs():
 
 def switch_write_mode(mode):
     preserve_write_inputs()
+    save_current_question_answer()
     st.session_state.write_mode = mode
 
 
@@ -368,7 +601,14 @@ def ensure_selected_categories():
     if not isinstance(categories, list):
         current = st.session_state.get("selected_category", "")
         categories = [current] if current else []
-        st.session_state.selected_categories = categories
+
+    # NFC cassette name is the main album/category. Keep it attached to every memory.
+    nfc_category = current_nfc_category() if "current_nfc_category" in globals() else ""
+    if nfc_category and nfc_category not in categories:
+        categories.insert(0, nfc_category)
+
+    st.session_state.selected_categories = categories
+    st.session_state.selected_category = ", ".join(categories) if categories else ""
     return categories
 
 
@@ -530,9 +770,133 @@ def update_photo_analysis():
     st.session_state.questions = result["questions"]
     st.session_state.suggested_categories = result.get("categories", [])
     st.session_state.music_query = result.get("music_query", "")
-    st.session_state.selected_category = ""
-    st.session_state.selected_categories = []
+    current_category = current_nfc_category()
+    st.session_state.album_category = current_category
+    st.session_state.selected_category = current_category
+    st.session_state.selected_categories = [current_category]
     st.session_state.analysis_done = True
+
+
+def ensure_question_answers():
+    answers = st.session_state.get("question_answers")
+    if not isinstance(answers, dict):
+        answers = {}
+        st.session_state.question_answers = answers
+    return answers
+
+
+def current_question_index():
+    questions = st.session_state.get("questions") or [st.session_state.get("question", "")]
+    count = max(1, min(3, len(questions)))
+    index = int(st.session_state.get("current_question_index", 0) or 0)
+    index = max(0, min(index, count - 1))
+    st.session_state.current_question_index = index
+    return index
+
+
+def sync_answer_to_memory_text():
+    answers = ensure_question_answers()
+    questions = st.session_state.get("questions") or []
+    lines = []
+    for index, question in enumerate(questions[:3]):
+        answer = str(answers.get(str(index), "")).strip()
+        if answer:
+            lines.append(f"Q{index + 1}. {question}\n{answer}")
+    st.session_state.memory_text = "\n\n".join(lines)
+    return st.session_state.memory_text
+
+
+def save_current_question_answer():
+    index = current_question_index()
+    answers = ensure_question_answers()
+    candidate_keys = [
+        f"question_answer_{index}",
+        f"question_answer_text_{index}",
+        f"voice_transcript_{index}",
+    ]
+    value = None
+    for key in candidate_keys:
+        candidate = st.session_state.get(key)
+        if candidate is not None:
+            value = candidate
+            break
+    if value is not None:
+        answers[str(index)] = str(value).strip()
+    else:
+        answers.setdefault(str(index), "")
+    st.session_state.question_answers = answers
+    sync_answer_to_memory_text()
+
+
+def set_write_question_index(index, canvas_key=None):
+    if canvas_key:
+        remember_canvas_state(canvas_key)
+    save_current_question_answer()
+    questions = st.session_state.get("questions") or fallback_photo_analysis()["questions"]
+    count = max(1, min(3, len(questions)))
+    st.session_state.current_question_index = max(0, min(count - 1, int(index or 0)))
+
+
+def cycle_pen_width(canvas_key=None):
+    if canvas_key:
+        remember_canvas_state(canvas_key)
+    current_width = int(st.session_state.get("stroke_width", st.session_state.get("pen_width", 3)) or 3)
+    next_width = 1 if current_width >= 7 else current_width + 1
+    st.session_state.pen_width = next_width
+    st.session_state.stroke_width = next_width
+
+
+def update_existing_memory_from_write(memory_id):
+    memory = load_memory_record(memory_id)
+    if not memory:
+        return False
+
+    handwriting = (
+        st.session_state.get("handwriting_path")
+        or memory.get("handwriting")
+        or handwriting_path_for(memory_id)
+    )
+    memory["questions"] = st.session_state.get("questions") or memory.get("questions") or []
+    memory["question"] = (
+        st.session_state.get("question")
+        or (memory["questions"][0] if memory.get("questions") else memory.get("question", ""))
+    )
+    memory["question_answers"] = ensure_question_answers()
+    memory["note"] = st.session_state.get("memory_text", "")
+    if handwriting:
+        memory["handwriting"] = handwriting
+
+    save_memory_record(memory)
+    st.session_state.play_memory = memory
+    st.session_state.selected_memory_id = memory_id
+    st.session_state.memory_id = memory_id
+    return True
+
+
+def finish_write_record(canvas_key=None):
+    if canvas_key:
+        remember_canvas_state(canvas_key)
+    if st.session_state.get("write_completed") and st.session_state.get("play_memory"):
+        st.session_state.page = "memory_done"
+        return
+
+    save_current_question_answer()
+    handwriting_image = st.session_state.get("handwriting_image_data")
+    if handwriting_image is not None and canvas_has_ink(handwriting_image):
+        save_handwriting(handwriting_image)
+
+    edit_memory_id = st.session_state.get("editing_memory_id")
+    if edit_memory_id and is_existing_edit_flow():
+        update_existing_memory_from_write(edit_memory_id)
+        st.session_state.editing_memory_id = None
+        st.session_state.edit_mode = "create"
+        st.session_state.write_completed = False
+        st.session_state.page = "home"
+        return
+
+    save_memory()
+    st.session_state.write_completed = True
+    st.session_state.page = "memory_done"
 
 
 def fallback_memory_summary(memory=None):
@@ -611,8 +975,17 @@ def save_memory(include_summary=True):
     if not st.session_state.memory_id:
         st.session_state.memory_id = str(uuid.uuid4())[:8]
     handwriting = st.session_state.handwriting_path or handwriting_path_for(st.session_state.memory_id)
+    nfc_category = current_nfc_category()
+    categories = ensure_selected_categories()
+    if nfc_category and nfc_category not in categories:
+        categories.insert(0, nfc_category)
+    st.session_state.selected_category = nfc_category
+
     data = {
         "id": st.session_state.memory_id,
+        "nfc_uid": st.session_state.get("nfc_uid", ""),
+        "nfc_label": nfc_category,
+        "nfc_category": nfc_category,
         "photo": st.session_state.photo_path,
         "keywords": st.session_state.keywords,
         "analysis_label": st.session_state.analysis_label,
@@ -621,10 +994,11 @@ def save_memory(include_summary=True):
         "suggested_categories": st.session_state.suggested_categories,
         "music_query": st.session_state.music_query,
         "note": st.session_state.memory_text,
+        "question_answers": ensure_question_answers(),
         "handwriting": handwriting,
         "selected_track": st.session_state.selected_track,
-        "category": st.session_state.selected_category,
-        "categories": ensure_selected_categories(),
+        "category": nfc_category,
+        "categories": categories,
         "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
     existing_summary = (st.session_state.get("play_memory") or {}).get("summary")
@@ -651,6 +1025,9 @@ def load_memories():
             local_photo = local_photo_path_for(memory_id)
             if os.path.exists(local_photo):
                 memory["photo"] = local_photo
+        if not memory.get("nfc_label"):
+            memory["nfc_label"] = memory_nfc_category(memory) if "memory_nfc_category" in globals() else "RE:01"
+            memory["nfc_category"] = memory["nfc_label"]
         if media_reference_available(memory.get("photo")):
             memories.append(memory)
     memories.sort(key=lambda item: item.get("time", ""), reverse=True)
@@ -784,8 +1161,8 @@ def family_playlist_groups(source_memories=None):
 
 
 def resolve_category_from_nfc_uid(uid):
-    # Future Firebase hook: UID -> category.
-    return None
+    # NFC UID/text maps directly to an album/category label in this prototype.
+    return normalize_nfc_label(uid or current_nfc_category())
 
 
 def open_category_album_from_uid(uid):
@@ -857,6 +1234,37 @@ def update_memory_track(memory_id, track):
     return True
 
 
+def current_music_memory_id():
+    candidates = [
+        st.session_state.get("selected_memory_id"),
+        st.session_state.get("memory_id"),
+        (st.session_state.get("play_memory") or {}).get("id"),
+    ]
+    for memory_id in candidates:
+        if memory_id:
+            return memory_id
+    return None
+
+
+def save_selected_track_to_current_memory():
+    selected_track = st.session_state.get("selected_track")
+    if not selected_track:
+        st.session_state.music_notice = "음악을 먼저 선택해주세요."
+        return False
+
+    memory_id = current_music_memory_id()
+    if not memory_id:
+        st.session_state.music_notice = "음악을 저장할 추억을 찾지 못했어요."
+        return False
+
+    if not update_memory_track(memory_id, selected_track):
+        st.session_state.music_notice = "음악을 저장할 추억을 찾지 못했어요."
+        return False
+
+    st.session_state.music_notice = ""
+    return True
+
+
 def finish_existing_music_edit():
     st.session_state.editing_memory_id = None
     st.session_state.edit_mode = "create"
@@ -889,6 +1297,9 @@ def album_category_from_state(memory=None):
     explicit = str(st.session_state.get("album_category") or "").strip()
     if explicit:
         return explicit
+    nfc_category = current_nfc_category()
+    if nfc_category:
+        return nfc_category
     selected_categories = st.session_state.get("selected_categories")
     if isinstance(selected_categories, list) and selected_categories:
         return str(selected_categories[0]).strip()
@@ -931,12 +1342,14 @@ def select_album_memory(memory_id):
     picked = next((memory for memory in load_memories() if memory.get("id") == memory_id), None)
     if not picked:
         return
+    set_current_nfc_category(memory_nfc_category(picked))
     st.session_state.album_selected_memory_id = memory_id
     st.session_state.selected_memory_id = memory_id
     st.session_state.play_memory = picked
     st.session_state.memory_id = memory_id
     st.session_state.photo_path = photo_path_for_memory(picked)
     st.session_state.memory_text = picked.get("note", st.session_state.get("memory_text", ""))
+    st.session_state.question_answers = picked.get("question_answers") or st.session_state.get("question_answers", {})
     st.session_state.handwriting_path = picked.get("handwriting") or handwriting_path_for(memory_id)
     st.session_state.analysis_label = picked.get("analysis_label") or st.session_state.get("analysis_label", "사진 속 순간")
     st.session_state.suggested_categories = picked.get("suggested_categories") or picked.get("categories") or []
@@ -948,7 +1361,7 @@ def select_album_memory(memory_id):
 
 
 def open_category_album(category=None, memory_id=None):
-    category = str(category or "").strip()
+    category = str(category or current_nfc_category()).strip()
     album_memories = album_memories_for_category(category, strict=bool(category))
     if category:
         st.session_state.album_category = category
@@ -958,7 +1371,8 @@ def open_category_album(category=None, memory_id=None):
         select_album_memory(album_memories[0].get("id"))
         if category:
             st.session_state.album_category = category
-    st.session_state.page = "video"
+    # 현재 버전에서는 앨범/재생 화면을 사용하지 않으므로 선택 상태만 저장하고 홈으로 이동
+    st.session_state.page = "home"
     return bool(memory_id or album_memories)
 
 
@@ -972,6 +1386,7 @@ def active_memory():
                 st.session_state.play_memory = item
                 st.session_state.selected_memory_id = memory_id
                 st.session_state.memory_text = item.get("note", st.session_state.get("memory_text", ""))
+                st.session_state.question_answers = item.get("question_answers") or st.session_state.get("question_answers", {})
                 st.session_state.analysis_label = item.get("analysis_label") or st.session_state.get("analysis_label", "사진 속 순간")
                 st.session_state.suggested_categories = item.get("suggested_categories") or item.get("categories") or []
                 st.session_state.music_query = item.get("music_query") or st.session_state.get("music_query", "")
@@ -988,6 +1403,7 @@ def active_memory():
         st.session_state.memory_id = item.get("id") or st.session_state.get("memory_id")
         st.session_state.photo_path = item.get("photo") or st.session_state.get("photo_path")
         st.session_state.memory_text = item.get("note", st.session_state.get("memory_text", ""))
+        st.session_state.question_answers = item.get("question_answers") or st.session_state.get("question_answers", {})
         st.session_state.analysis_label = item.get("analysis_label") or st.session_state.get("analysis_label", "사진 속 순간")
         st.session_state.suggested_categories = item.get("suggested_categories") or item.get("categories") or []
         st.session_state.music_query = item.get("music_query") or st.session_state.get("music_query", "")
@@ -1119,6 +1535,87 @@ def spotify_recommendations(query="korean old pop memories"):
         return fallback
 
 
+DEFAULT_TRACK_LYRICS = [
+    "오늘의 기억이 천천히 흐르고",
+    "그날의 바람이 다시 불어와",
+    "우리의 시간이 노래가 되어",
+    "마음속에 오래 남아요",
+]
+
+
+def normalize_track(track):
+    track = track or {}
+    lyrics = track.get("lyrics")
+    if not isinstance(lyrics, list) or not lyrics:
+        lyrics = DEFAULT_TRACK_LYRICS
+    return {
+        "title": str(track.get("title") or "노래 제목").strip(),
+        "artist": str(track.get("artist") or "가수").strip(),
+        "image": str(track.get("image") or "").strip(),
+        "preview_url": str(track.get("preview_url") or "").strip(),
+        "lyrics": [str(line) for line in lyrics if str(line).strip()],
+    }
+
+
+
+def get_lyrics_from_lrclib(title, artist):
+    """Fetch real lyrics from LRCLIB. Returns lyric lines or [] if unavailable."""
+    title = str(title or "").strip()
+    artist = str(artist or "").strip()
+    if not title:
+        return []
+    try:
+        response = requests.get(
+            "https://lrclib.net/api/search",
+            params={"track_name": title, "artist_name": artist},
+            timeout=8,
+        )
+        response.raise_for_status()
+        results = response.json()
+        if not isinstance(results, list) or not results:
+            return []
+
+        picked = results[0]
+        lower_title = title.lower()
+        lower_artist = artist.lower().split(",")[0].strip()
+        for item in results:
+            item_title = str(item.get("trackName") or "").lower()
+            item_artist = str(item.get("artistName") or "").lower()
+            if lower_title and lower_title in item_title and (not lower_artist or lower_artist in item_artist):
+                picked = item
+                break
+
+        lyrics_text = picked.get("syncedLyrics") or picked.get("plainLyrics") or ""
+        if not lyrics_text:
+            return []
+
+        lines = []
+        for line in lyrics_text.splitlines():
+            line = str(line).strip()
+            if not line:
+                continue
+            while line.startswith("[") and "]" in line:
+                line = line.split("]", 1)[-1].strip()
+            if line and line not in lines:
+                lines.append(line)
+        return lines[:10]
+    except Exception:
+        return []
+
+
+def filtered_music_tracks(tracks, query):
+    normalized = [normalize_track(track) for track in tracks or []]
+    search = str(query or "").strip().lower()
+    if not search:
+        return normalized
+    return [
+        track
+        for track in normalized
+        if search in track.get("title", "").lower()
+        or search in track.get("artist", "").lower()
+    ]
+
+
 def photo_music_query(memory=None):
     memory = memory or {}
     explicit_query = str(memory.get("music_query") or st.session_state.get("music_query") or "").strip()
@@ -1216,6 +1713,8 @@ note_text = st.query_params.get("note")
 mode = st.query_params.get("mode")
 tab = st.query_params.get("tab")
 category_param = st.query_params.get("category")
+tool_param = st.query_params.get("tool")
+color_param = st.query_params.get("color")
 if memory_id:
     restore_photo(memory_id)
 if action:
@@ -1223,6 +1722,12 @@ if action:
         st.session_state.editing_memory_id = None
         st.session_state.edit_mode = "create"
         st.session_state.page = "home"
+    elif action == "nfc_intro":
+        st.session_state.page = "nfc_intro"
+    elif action == "nfc_detected":
+        handle_nfc_detected(st.query_params.get("uid") or "RE01")
+    elif action == "nfc_recognized":
+        st.session_state.page = "nfc_recognized"
     elif action == "family_home":
         st.session_state.page = "family_home"
     elif action == "home_tab":
@@ -1240,14 +1745,18 @@ if action:
         else:
             st.session_state.page = "family_home"
     elif action == "record":
+        active_nfc = current_nfc_category()
         reset_flow()
+        set_current_nfc_category(active_nfc)
         st.session_state.page = "scan_upload"
     elif action == "select" and memory_id:
         picked = next((m for m in memories if m.get("id") == memory_id), None)
         if picked:
             st.session_state.selected_memory_id = memory_id
+            set_current_nfc_category(memory_nfc_category(picked))
             st.session_state.play_memory = picked
             st.session_state.memory_text = picked.get("note", "")
+            st.session_state.question_answers = picked.get("question_answers") or {}
             st.session_state.handwriting_path = picked.get("handwriting") or handwriting_path_for(memory_id)
             st.session_state.keywords = picked.get("keywords") or st.session_state.keywords
             st.session_state.analysis_label = picked.get("analysis_label") or st.session_state.get("analysis_label", "사진 속 순간")
@@ -1274,34 +1783,64 @@ if action:
         st.session_state.home_tab = "music"
         st.session_state.home_playing_memory_id = memory_id
         st.session_state.page = "home"
+    elif action == "playback_exit":
+        st.session_state.playback_memories = []
+        st.session_state.playback_index = 0
+        st.session_state.page = "home"
     elif action == "playback":
-        picked = next((m for m in memories if m.get("id") == st.session_state.selected_memory_id), None)
-        if picked:
-            st.session_state.play_memory = picked
-            st.session_state.selected_category = picked.get("category") or st.session_state.selected_category
-            st.session_state.selected_categories = picked.get("categories") or ([st.session_state.selected_category] if st.session_state.selected_category else [])
-            st.session_state.analysis_label = picked.get("analysis_label") or st.session_state.get("analysis_label", "사진 속 순간")
-            st.session_state.suggested_categories = picked.get("suggested_categories") or picked.get("categories") or []
-            st.session_state.music_query = picked.get("music_query") or st.session_state.get("music_query", "")
-            categories = memory_categories(picked)
-            open_category_album(categories[0] if categories else st.session_state.selected_category, picked.get("id"))
-        elif memories:
-            st.session_state.play_memory = memories[0]
-            st.session_state.selected_category = memories[0].get("category") or st.session_state.selected_category
-            st.session_state.selected_categories = memories[0].get("categories") or ([st.session_state.selected_category] if st.session_state.selected_category else [])
-            st.session_state.analysis_label = memories[0].get("analysis_label") or st.session_state.get("analysis_label", "사진 속 순간")
-            st.session_state.suggested_categories = memories[0].get("suggested_categories") or memories[0].get("categories") or []
-            st.session_state.music_query = memories[0].get("music_query") or st.session_state.get("music_query", "")
-            categories = memory_categories(memories[0])
-            open_category_album(categories[0] if categories else st.session_state.selected_category, memories[0].get("id"))
+        active_nfc = current_nfc_category()
+        playback_memories = memories_for_current_nfc(load_memories(), active_nfc)
+        if playback_memories:
+            st.session_state.playback_memories = playback_memories
+            st.session_state.playback_index = 0
+            st.session_state.playback_started_at = time.time()
+            st.session_state.playback_caption_index = 0
+            st.session_state.playback_caption_started_at = time.time()
+            st.session_state.playback_song_index = 0
+            st.session_state.playback_song_started_at = time.time()
+            st.session_state.page = "play_fullscreen"
         else:
-            reset_flow()
-            st.session_state.page = "scan_upload"
+            st.session_state.page = "home"
     elif action == "scan_start":
-        st.session_state.page = "scan_running"
+        if media_reference_available(st.session_state.get("photo_path")):
+            st.session_state.page = "scan_running"
+        else:
+            st.session_state.scan_upload_notice = "사진을 먼저 선택해주세요."
+            st.session_state.page = "scan_upload"
     elif action == "write":
         if mode in ("voice", "chat", "handwriting"):
-            st.session_state.write_mode = mode
+            switch_write_mode(mode)
+        st.session_state.page = "write"
+    elif action == "write_question_prev":
+        current_index = int(st.session_state.get("current_question_index", 0) or 0)
+        set_write_question_index(current_index - 1, current_canvas_key())
+        st.session_state.page = "write"
+    elif action == "write_question_next":
+        current_index = int(st.session_state.get("current_question_index", 0) or 0)
+        set_write_question_index(current_index + 1, current_canvas_key())
+        st.session_state.page = "write"
+    elif action == "write_question_done":
+        questions_count = len(st.session_state.get("questions") or fallback_photo_analysis()["questions"])
+        current_index = int(st.session_state.get("current_question_index", 0) or 0)
+        st.session_state.current_question_index = max(0, min(questions_count - 1, current_index))
+        finish_write_record(current_canvas_key())
+    elif action == "write_tool":
+        if tool_param in ("pen", "eraser"):
+            set_drawing_tool(tool_param, current_canvas_key())
+        st.session_state.page = "write"
+    elif action == "write_color":
+        cleaned_color = str(color_param or "").strip().lstrip("#")
+        if len(cleaned_color) == 6:
+            set_pen_color(f"#{cleaned_color}", current_canvas_key())
+        st.session_state.page = "write"
+    elif action == "write_width_cycle":
+        cycle_pen_width(current_canvas_key())
+        st.session_state.page = "write"
+    elif action == "write_undo":
+        undo_handwriting(current_canvas_key())
+        st.session_state.page = "write"
+    elif action == "write_redo":
+        redo_handwriting()
         st.session_state.page = "write"
     elif action == "music":
         if st.session_state.get("edit_mode") != "music_edit":
@@ -1310,46 +1849,18 @@ if action:
         if note_text is not None:
             st.session_state.memory_text = note_text
         st.session_state.page = "music"
-    elif action == "category_loading":
+    elif action == "music_loading":
+        st.session_state.page = "music_loading"
+    elif action == "music_done":
+        st.session_state.page = "music_done"
+    elif action in ("category_loading", "category_edit", "category_pick", "album_done", "nfc_scan", "nfc_done", "video", "player"):
+        # 현재 버전에서는 카테고리/앨범완료/재생 화면을 사용하지 않으므로 홈으로 보낸다.
         if is_existing_edit_flow():
             finish_existing_music_edit()
         else:
-            st.session_state.page = "category_loading"
-    elif action == "category_edit":
-        if is_existing_edit_flow():
-            finish_existing_music_edit()
-        else:
-            st.session_state.page = "category_edit"
-    elif action == "category_pick":
-        picked_category = st.query_params.get("category")
-        if picked_category:
-            st.session_state.selected_categories = [picked_category]
-            st.session_state.selected_category = picked_category
-            st.session_state.category_direct_text = picked_category
-            st.session_state.category_direct_input = picked_category
-        if is_existing_edit_flow():
-            finish_existing_music_edit()
-        else:
-            st.session_state.page = "category_edit"
-    elif action == "album_done":
-        if is_existing_edit_flow():
-            finish_existing_music_edit()
-        else:
-            st.session_state.page = "album_done"
-    elif action == "nfc_scan":
-        if is_existing_edit_flow():
-            finish_existing_music_edit()
-        else:
-            st.session_state.page = "nfc_scan"
-    elif action == "nfc_done":
-        if is_existing_edit_flow():
-            finish_existing_music_edit()
-        else:
-            st.session_state.page = "nfc_done"
-    elif action == "video":
-        open_category_album(album_category_from_state(st.session_state.get("play_memory") or {}), st.session_state.get("selected_memory_id"))
-    elif action == "player":
-        open_category_album(album_category_from_state(st.session_state.get("play_memory") or {}), st.session_state.get("selected_memory_id"))
+            st.session_state.page = "home"
+    elif action == "memory_done":
+        st.session_state.page = "memory_done"
     elif action == "delete" and memory_id:
         delete_memory(memory_id)
         st.session_state.play_memory = None
@@ -1438,27 +1949,8 @@ div[data-testid="stFileUploader"] [data-testid="stFileUploaderDropzone"] { min-h
 .wide-black { height:58px; border-radius:999px; margin-top:18px; background:#050505; color:#fff; display:flex; flex-direction:column; align-items:center; justify-content:center; box-shadow:0 12px 24px rgba(0,0,0,.24); font-size:15px; font-weight:900; }
 .wide-black small { margin-top:3px; font-size:10px; font-weight:600; color:#ddd; }
 
-.write-screen { min-height:520px; background:radial-gradient(circle at 8% 55%, rgba(255,105,33,.65), transparent 22%), radial-gradient(circle at 102% 96%, rgba(255,105,33,.65), transparent 24%), #fff; padding:24px 44px 34px; }
-.write-screen.handwriting { min-height:620px; }
-.write-photo { width:350px; height:200px; margin:0 auto 28px; border-radius:6px; background:#dde7f1; display:flex; align-items:center; justify-content:center; overflow:hidden; color:#55728a; }
-.write-photo img { width:100%; height:100%; object-fit:cover; }
-.note-box { min-height:210px; border-radius:20px; background:#fff; box-shadow:0 14px 34px rgba(0,0,0,.08); padding:18px; }
-.note-box.handwriting-note { min-height:322px; }
-.method-row { display:grid; grid-template-columns:1fr 1fr; gap:14px; margin-bottom:14px; }
-.method-pill { height:34px; border-radius:999px; background:#f8f8f8; box-shadow:0 6px 14px rgba(0,0,0,.08); display:flex; align-items:center; justify-content:center; font-size:12px; font-weight:900; }
-.method-pill.active { background:#050505; color:#fff; }
-.memory-input { width:100%; min-height:126px; border:0; outline:0; resize:none; font-family:inherit; font-size:15px; line-height:1.6; background:transparent; color:#111; }
-.memory-input::placeholder { color:#b6b6b6; }
 .write-actions { display:flex; justify-content:flex-end; margin-top:18px; }
 .next-button { width:132px; height:42px; border:0; border-radius:999px; background:#050505; color:#fff; box-shadow:0 10px 22px rgba(0,0,0,.2); display:flex; align-items:center; justify-content:center; font-family:inherit; font-size:13px; font-weight:900; cursor:pointer; }
-.canvas-slot { height:230px; border-radius:14px; background:#fff; border:1px solid #eee; display:flex; align-items:center; justify-content:center; color:#c8c8c8; font-size:13px; font-weight:800; }
-iframe[title*="streamlit_drawable_canvas"] { display:block; border-radius:14px; }
-.handwriting-controls { width:660px; max-width:calc(100% - 88px); margin:10px auto 0; position:relative; z-index:21; }
-.handwriting-controls .stButton > button { background:#050505; color:#fff; box-shadow:0 10px 22px rgba(0,0,0,.18); }
-.handwriting-shell { width:760px; max-width:100%; margin:0 auto; padding:0 44px 0; }
-.handwriting-title { font-size:13px; font-weight:900; margin-bottom:8px; color:#111; }
-.handwriting-preview { width:100%; margin-top:12px; border-radius:14px; background:#fff; border:1px solid #eee; overflow:hidden; }
-.handwriting-preview img { width:100%; display:block; }
 
 .music-layout { display:grid; grid-template-columns:44% 56%; gap:28px; }
 
@@ -1490,8 +1982,8 @@ iframe[title*="streamlit_drawable_canvas"] { display:block; border-radius:14px; 
 .song-name { margin-top:8px; font-size:16px; font-weight:900; }
 .memory-review { width:100%; max-width:560px; margin-top:18px; border-radius:20px; background:#fff; box-shadow:0 14px 32px rgba(0,0,0,.08); padding:18px; text-align:left; }
 .review-label { font-size:12px; font-weight:900; color:#777; margin-bottom:8px; }
-.review-note { min-height:70px; font-size:14px; line-height:1.55; color:#111; white-space:pre-wrap; }
-.music-chip { margin-top:14px; min-height:42px; border-radius:999px; background:#f5f5f5; display:flex; align-items:center; justify-content:center; gap:10px; padding:0 18px; font-size:13px; font-weight:900; }
+.review-note { min-height:70px; font-size:14px; line-height:1.42; color:#111; white-space:pre-wrap; }
+.music-chip { margin-top:14px; min-height:42px; border-radius:999px; background:#f5f5f5; display:flex; align-items:center; justify-content:center; gap:10px; padding:0 16px; font-size:13px; font-weight:900; }
 .audio-player { width:100%; margin-top:12px; }
 .review-handwriting { width:100%; margin-top:14px; border-radius:14px; border:1px solid #eee; overflow:hidden; background:#fff; }
 .review-handwriting img { width:100%; display:block; }
@@ -1519,8 +2011,8 @@ iframe[title*="streamlit_drawable_canvas"] { display:block; border-radius:14px; 
 .music-row-line { height:1px; background:#eee; margin:4px 0 7px; }
 .music-cover-empty { width:38px; height:38px; background:#dde7f1; border-radius:4px; }
 .music-selected-box { margin:12px 0 10px; padding:10px 12px; border-radius:12px; background:rgba(239,90,40,.10); border-left:4px solid #ef5a28; font-size:13px; font-weight:900; }
-.music-page-shell div[data-testid="stTextInput"] input { height:44px !important; border:0 !important; border-radius:4px !important; background:#f4f4f4 !important; padding-left:20px !important; font-size:15px !important; box-shadow:none !important; }
-.music-page-shell div[data-testid="stButton"] button { height:44px !important; min-height:44px !important; border-radius:999px !important; border:0 !important; background:#050505 !important; color:#fff !important; box-shadow:0 10px 22px rgba(0,0,0,.12) !important; font-weight:900 !important; }
+.music-page-shell div[data-testid="stTextInput"] input { height:42px !important; border:0 !important; border-radius:4px !important; background:#f4f4f4 !important; padding-left:20px !important; font-size:15px !important; box-shadow:none !important; }
+.music-page-shell div[data-testid="stButton"] button { height:42px !important; min-height:42px !important; border-radius:999px !important; border:0 !important; background:#050505 !important; color:#fff !important; box-shadow:0 10px 22px rgba(0,0,0,.12) !important; font-weight:900 !important; }
 .music-page-shell [data-testid="stImage"] img { border-radius:0 !important; }
 .music-page-shell [data-testid="stVerticalBlock"] { gap:.35rem !important; }
 @media (max-width:820px) { .music-page-shell { padding:24px 24px 32px; } }
@@ -1562,7 +2054,6 @@ body,
 .stApp .app-card,
 .stApp .home,
 .stApp .flow,
-.stApp .write-screen,
 .stApp .native-music-wrap,
 .stApp .music-page-shell {
     width:100% !important;
@@ -1594,14 +2085,6 @@ body,
 .stApp .pad-card {
     height:auto !important;
     min-height:clamp(300px, 52dvh, 420px) !important;
-}
-.stApp div[data-testid="stCustomComponentV1"]:has(iframe[title*="streamlit_drawable_canvas"]),
-.stApp .element-container:has(iframe[title*="streamlit_drawable_canvas"]) {
-    height:clamp(320px, 54dvh, 430px) !important;
-    max-height:clamp(320px, 54dvh, 430px) !important;
-}
-.stApp iframe[title*="streamlit_drawable_canvas"] {
-    height:clamp(320px, 54dvh, 430px) !important;
 }
 .stApp .music-photo-box {
     height:clamp(150px, 26dvh, 220px) !important;
@@ -1686,21 +2169,448 @@ render_global_back_button()
 
 if page == "splash":
     html(f"""
-<div class="app-card splash">
-  <a class="splash-hit" href="?action=home" target="_self"></a>
+<style>
+html,
+body,
+.stApp,
+.stApp [data-testid="stAppViewContainer"],
+.stApp [data-testid="stMain"],
+.stApp [data-testid="stMainBlockContainer"] {{
+    width:100vw !important;
+    height:100vh !important;
+    min-height:100vh !important;
+    margin:0 !important;
+    padding:0 !important;
+    overflow:hidden !important;
+    scrollbar-width:none !important;
+}}
+html::-webkit-scrollbar,
+body::-webkit-scrollbar,
+.stApp::-webkit-scrollbar,
+.stApp [data-testid="stAppViewContainer"]::-webkit-scrollbar,
+.stApp [data-testid="stMain"]::-webkit-scrollbar,
+.stApp [data-testid="stMainBlockContainer"]::-webkit-scrollbar {{
+    display:none !important;
+    width:0 !important;
+    height:0 !important;
+}}
+.stApp {{
+    background:#777 !important;
+    color:#111 !important;
+}}
+.stApp .block-container {{
+    width:1180px !important;
+    min-width:1180px !important;
+    max-width:1180px !important;
+    height:760px !important;
+    min-height:760px !important;
+    max-height:760px !important;
+    margin:0 auto !important;
+    padding:0 !important;
+    overflow:hidden !important;
+    position:relative !important;
+    border-radius:0 !important;
+    background:transparent !important;
+}}
+.stApp .block-container > div,
+.stApp .block-container div[data-testid="stVerticalBlock"] {{
+    height:760px !important;
+    min-height:760px !important;
+    max-height:760px !important;
+    gap:0 !important;
+    overflow:hidden !important;
+}}
+header,
+[data-testid="stToolbar"],
+[data-testid="stDecoration"],
+#MainMenu,
+footer {{
+    display:none !important;
+}}
+.splash-start-screen {{
+    position:fixed;
+    left:50%;
+    top:50%;
+    width:1180px;
+    height:760px;
+    transform:translate(-50%, -50%);
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    overflow:hidden;
+    background:#fff;
+    z-index:1000;
+}}
+.splash-start-screen .splash-logo-img {{
+    width:213px !important;
+    height:auto !important;
+    transform:none !important;
+}}
+.splash-hit {{
+    position:absolute;
+    inset:0;
+    z-index:5;
+    display:block;
+    background:transparent;
+    cursor:pointer;
+}}
+</style>
+<div class="splash-start-screen">
+  <a class="splash-hit" href="?action=nfc_intro" target="_self" aria-label="시작"></a>
   {SPLASH_LOGO_HTML}
 </div>
 """)
 
+elif page == "nfc_intro":
+    html("""
+<style>
+html,
+body,
+.stApp,
+.stApp [data-testid="stAppViewContainer"],
+.stApp [data-testid="stMain"],
+.stApp [data-testid="stMainBlockContainer"] {
+    width:100vw !important;
+    height:100vh !important;
+    min-height:100vh !important;
+    margin:0 !important;
+    overflow:hidden !important;
+}
+.stApp { background:#777 !important; color:#111 !important; }
+.stApp .block-container {
+    width:1180px !important;
+    min-width:1180px !important;
+    max-width:1180px !important;
+    height:760px !important;
+    min-height:760px !important;
+    max-height:760px !important;
+    margin:0 auto !important;
+    padding:0 !important;
+    overflow:hidden !important;
+    position:relative !important;
+    border-radius:0 !important;
+    background:transparent !important;
+}
+header, [data-testid="stToolbar"], [data-testid="stDecoration"], #MainMenu, footer { display:none !important; }
+.stApp .block-container div[data-testid="stVerticalBlock"] { gap:0 !important; }
+.nfc-start-screen {
+    position:fixed;
+    left:50%;
+    top:50%;
+    width:1180px;
+    height:760px;
+    transform:translate(-50%, -50%);
+    overflow:hidden;
+    z-index:1000;
+    background:
+      radial-gradient(circle at 0% 76%, rgba(255,132,70,.22), transparent 33%),
+      radial-gradient(circle at 98% 86%, rgba(255,132,70,.23), transparent 35%),
+      #fbfbfb;
+}
+.nfc-start-title {
+    position:absolute;
+    left:0;
+    right:0;
+    top:128px;
+    text-align:center;
+    font-size:26px;
+    line-height:1;
+    font-weight:1000;
+}
+.nfc-start-arrow {
+    position:absolute;
+    left:50%;
+    top:270px;
+    width:54px;
+    height:88px;
+    transform:translateX(-50%);
+}
+.nfc-start-arrow::before {
+    content:"";
+    position:absolute;
+    left:12px;
+    top:0;
+    width:30px;
+    height:52px;
+    background:linear-gradient(180deg, #fff 0 20%, #ffd6c3 20% 38%, #fff 38% 54%, #ffd6c3 54%);
+}
+.nfc-start-arrow::after {
+    content:"";
+    position:absolute;
+    left:0;
+    bottom:0;
+    width:0;
+    height:0;
+    border-left:27px solid transparent;
+    border-right:27px solid transparent;
+    border-top:35px solid #ffd6c3;
+}
+.nfc-start-rings {
+    position:absolute;
+    left:50%;
+    top:392px;
+    width:760px;
+    height:240px;
+    transform:translateX(-50%);
+}
+.nfc-start-ring {
+    position:absolute;
+    left:50%;
+    top:50%;
+    transform:translate(-50%, -50%);
+    border:1px solid rgba(255,123,45,.33);
+    border-radius:50%;
+}
+.nfc-start-ring.r1 { width:200px; height:74px; background:rgba(255,123,45,.16); }
+.nfc-start-ring.r2 { width:330px; height:112px; background:rgba(255,123,45,.08); }
+.nfc-start-ring.r3 { width:480px; height:160px; }
+.nfc-start-ring.r4 { width:660px; height:205px; }
+.nfc-start-ring.r5 { width:760px; height:240px; opacity:.75; }
+.nfc-start-slot {
+    position:absolute;
+    left:50%;
+    top:50%;
+    width:270px;
+    height:28px;
+    transform:translate(-50%, -74%);
+    border:2px solid rgba(255,123,45,.48);
+    border-radius:19px 19px 7px 7px;
+    background:linear-gradient(180deg, rgba(255,210,188,.85), rgba(255,183,151,.48));
+    box-shadow:0 10px 26px rgba(255,123,45,.16);
+}
+.nfc-start-label {
+    position:absolute;
+    left:0;
+    right:0;
+    top:568px;
+    text-align:center;
+}
+.nfc-start-label strong {
+    display:block;
+    color:#050505;
+    font-size:28px;
+    line-height:1;
+    font-weight:1000;
+    margin-bottom:16px;
+}
+.nfc-start-label span {
+    display:block;
+    color:#111;
+    font-size:18px;
+    line-height:1;
+    font-weight:700;
+}
+.nfc-start-hit {
+    position:absolute;
+    left:50%;
+    top:340px;
+    width:780px;
+    height:300px;
+    transform:translateX(-50%);
+    display:block;
+    z-index:30;
+    cursor:pointer;
+    background:transparent;
+}
+</style>
+<div class="nfc-start-screen">
+  <a class="nfc-start-hit" href="?action=nfc_detected&uid=RE01" target="_self" aria-label="NFC 인식"></a>
+  <div class="nfc-start-title">카세트를 꽂아주세요</div>
+  <div class="nfc-start-arrow"></div>
+  <div class="nfc-start-rings">
+    <div class="nfc-start-ring r5"></div>
+    <div class="nfc-start-ring r4"></div>
+    <div class="nfc-start-ring r3"></div>
+    <div class="nfc-start-ring r2"></div>
+    <div class="nfc-start-ring r1"></div>
+    <div class="nfc-start-slot"></div>
+  </div>
+  <div class="nfc-start-label">
+    <strong>NFC 인식 영역</strong>
+  </div>
+</div>
+""")
+
+elif page == "nfc_recognized":
+    nfc_label = escape(st.session_state.get("nfc_label") or "RE:01")
+    html(f"""
+<style>
+html,
+body,
+.stApp,
+.stApp [data-testid="stAppViewContainer"],
+.stApp [data-testid="stMain"],
+.stApp [data-testid="stMainBlockContainer"] {{
+    width:100vw !important;
+    height:100vh !important;
+    min-height:100vh !important;
+    margin:0 !important;
+    overflow:hidden !important;
+}}
+.stApp {{ background:#777 !important; color:#111 !important; }}
+.stApp .block-container {{
+    width:1180px !important;
+    min-width:1180px !important;
+    max-width:1180px !important;
+    height:760px !important;
+    min-height:760px !important;
+    max-height:760px !important;
+    margin:0 auto !important;
+    padding:0 !important;
+    overflow:hidden !important;
+    position:relative !important;
+    border-radius:0 !important;
+    background:transparent !important;
+}}
+header, [data-testid="stToolbar"], [data-testid="stDecoration"], #MainMenu, footer {{ display:none !important; }}
+.stApp .block-container div[data-testid="stVerticalBlock"] {{ gap:0 !important; }}
+.nfc-start-screen {{
+    position:fixed;
+    left:50%;
+    top:50%;
+    width:1180px;
+    height:760px;
+    transform:translate(-50%, -50%);
+    overflow:hidden;
+    z-index:1000;
+    background:
+      radial-gradient(circle at 0% 76%, rgba(255,132,70,.22), transparent 33%),
+      radial-gradient(circle at 98% 86%, rgba(255,132,70,.23), transparent 35%),
+      #fbfbfb;
+}}
+.nfc-start-rings {{
+    position:absolute;
+    left:50%;
+    top:365px;
+    width:760px;
+    height:240px;
+    transform:translateX(-50%);
+}}
+.nfc-start-ring {{
+    position:absolute;
+    left:50%;
+    top:50%;
+    transform:translate(-50%, -50%);
+    border:1px solid rgba(255,123,45,.33);
+    border-radius:50%;
+}}
+.nfc-start-ring.r1 {{ width:200px; height:74px; background:rgba(255,123,45,.16); }}
+.nfc-start-ring.r2 {{ width:330px; height:112px; background:rgba(255,123,45,.08); }}
+.nfc-start-ring.r3 {{ width:480px; height:160px; }}
+.nfc-start-ring.r4 {{ width:660px; height:205px; }}
+.nfc-start-ring.r5 {{ width:760px; height:240px; opacity:.75; }}
+.nfc-start-card {{
+    position:absolute;
+    left:50%;
+    top:212px;
+    width:170px;
+    height:268px;
+    transform:translateX(-50%);
+    border-radius:16px;
+    background:linear-gradient(180deg, rgba(255,255,255,.42), rgba(255,245,240,.32));
+    border:1px solid rgba(255,255,255,.62);
+    box-shadow:0 22px 42px rgba(255,123,45,.18), inset 0 0 24px rgba(255,255,255,.30);
+    backdrop-filter:blur(8px);
+    animation:nfcCardDrop 2.25s cubic-bezier(.18,.82,.18,1) both;
+}}
+.nfc-start-card-label {{
+    position:absolute;
+    left:22px;
+    top:27px;
+    color:#fff;
+    font-size:28px;
+    line-height:1;
+    font-weight:800;
+}}
+.nfc-start-card-inner {{
+    position:absolute;
+    left:41px;
+    top:65px;
+    width:88px;
+    height:140px;
+    border-radius:15px;
+    background:linear-gradient(180deg, #ff8e69 0%, #ffd6c8 100%);
+    box-shadow:0 0 22px rgba(255,104,48,.55);
+}}
+.nfc-start-card-logo {{
+    position:absolute;
+    left:0;
+    right:0;
+    bottom:30px;
+    text-align:center;
+    color:#fff;
+    font-size:12px;
+    line-height:.8;
+    font-weight:1000;
+}}
+.nfc-start-card-logo small {{
+    display:block;
+    margin-top:3px;
+    font-size:5px;
+    letter-spacing:2px;
+}}
+.nfc-start-card-dot {{
+    position:absolute;
+    width:9px;
+    height:9px;
+    border-radius:50%;
+    background:#fff;
+}}
+.nfc-start-card-dot.d1 {{ left:12px; top:12px; }}
+.nfc-start-card-dot.d2 {{ right:12px; top:12px; }}
+.nfc-start-card-dot.d3 {{ left:12px; bottom:12px; }}
+.nfc-start-card-dot.d4 {{ right:12px; bottom:12px; }}
+.nfc-start-big-label {{
+    position:absolute;
+    left:0;
+    right:0;
+    top:548px;
+    text-align:center;
+    color:#ff5b18;
+    font-size:74px;
+    line-height:1;
+    font-weight:1000;
+}}
+@keyframes nfcCardDrop {{
+    0% {{ opacity:0; transform:translate(-50%, -190px); }}
+    100% {{ opacity:1; transform:translate(-50%, 0); }}
+}}
+</style>
+<div class="nfc-start-screen">
+  <div class="nfc-start-rings">
+    <div class="nfc-start-ring r5"></div>
+    <div class="nfc-start-ring r4"></div>
+    <div class="nfc-start-ring r3"></div>
+    <div class="nfc-start-ring r2"></div>
+    <div class="nfc-start-ring r1"></div>
+  </div>
+  <div class="nfc-start-card">
+    <div class="nfc-start-card-dot d1"></div>
+    <div class="nfc-start-card-dot d2"></div>
+    <div class="nfc-start-card-dot d3"></div>
+    <div class="nfc-start-card-dot d4"></div>
+    <div class="nfc-start-card-label">{nfc_label}</div>
+    <div class="nfc-start-card-inner"></div>
+    <div class="nfc-start-card-logo">Re:Play<small>RE:PLAY</small></div>
+  </div>
+  <div class="nfc-start-big-label">{nfc_label}</div>
+</div>
+""")
+    time.sleep(3.6)
+    go("home")
+
 elif page == "home":
-    home_memories = load_memories()
+    active_nfc = current_nfc_category()
+    st.session_state.album_category = active_nfc
+    all_home_memories = load_memories()
+    home_memories = memories_for_current_nfc(all_home_memories, active_nfc)
     memory_count = len(home_memories)
     current_tab = st.session_state.get("home_tab", "album")
     active_album = current_tab == "album"
     active_music = current_tab == "music"
     album_tab_class = " active" if active_album else ""
     music_tab_class = " active" if active_music else ""
-    kicker_html = '<div class="home-kicker">RE:01</div>' if active_album else ""
+    kicker_html = f'<div class="home-kicker">{escape(active_nfc)}</div>' if active_album else ""
 
     album_cards = []
     for memory in home_memories:
@@ -2250,9 +3160,9 @@ div[data-testid="stVerticalBlock"] {{ gap:0 !important; }}
 <div class="home-header">
   <div class="home-logo">{HOME_LOGO_HTML}</div>
   <div class="home-tools">
-    <a class="home-search-button" href="#" aria-label="검색"><span class="home-search-icon"></span></a>
+    <div class="home-search-button" aria-label="검색"><span class="home-search-icon"></span></div>
     <a class="home-family-button" href="?action=family_home" target="_self">가족앱</a>
-    <a class="home-help-button" href="#" aria-label="도움말">?</a>
+    <div class="home-help-button" aria-label="도움말">?</div>
   </div>
 </div>
 <section class="home-title-zone">
@@ -2638,7 +3548,7 @@ div[data-testid="stVerticalBlock"] {{ gap:0 !important; }}
     text-align:center;
     color:#8e857f;
     font-size:14px;
-    line-height:1.55;
+    line-height:1.42;
     font-weight:800;
 }}
 .family-photo-placeholder {{
@@ -2755,7 +3665,7 @@ div[data-testid="stVerticalBlock"] {{ gap:0 !important; }}
 
   <nav class="family-bottom-nav">
     <a class="family-nav-item active" href="?action=family_home" target="_self"><span>HOME</span>홈</a>
-    <a class="family-nav-item" href="#" target="_self"><span>SEARCH</span>검색</a>
+    <div class="family-nav-item"><span>SEARCH</span>검색</div>
     <a class="family-nav-item" href="?action=family_music" target="_self"><span>MUSIC</span>내 음악</a>
     <a class="family-nav-item" href="#family-members" target="_self"><span>FAMILY</span>가족</a>
   </nav>
@@ -2800,8 +3710,8 @@ div[data-testid="stVerticalBlock"] {{ gap:.55rem !important; }}
 .home-divider {{ height:1px; background:#d6d6d6; margin:0 42px 28px; }}
 .st-key-home_tab_album button,
 .st-key-home_tab_music button {{
-    height:44px !important;
-    min-height:44px !important;
+    height:42px !important;
+    min-height:42px !important;
     padding:0 4px !important;
     border:0 !important;
     border-radius:0 !important;
@@ -3065,1227 +3975,2440 @@ div[data-testid="stTextArea"] textarea { min-height:140px !important; resize:non
             st.rerun()
 
 elif page == "scan_upload":
-    photo = photo_markup()
-    memory_query = f"&memory={st.session_state.memory_id}" if st.session_state.memory_id else ""
+    has_photo = media_reference_available(st.session_state.get("photo_path"))
+    photo_src = image_src(st.session_state.photo_path) if has_photo else ""
+    photo_background = f'background-image:url("{escape(photo_src, quote=True)}") !important;' if photo_src else ""
+    scan_hint = "" if photo_src else "사진을 아래 스캔 공간 위에 올려주세요"
+    scan_icon_display = "display:none !important;" if photo_src else ""
     html(f"""
-<div class="app-card flow">
-  <div class="topbar"><a class="back" href="?action=back" target="_self">‹</a><div class="center">{FLOW_LOGO_HTML}</div><div class="guide">가이드</div></div>
-  <div class="scan-card"><div class="scan-frame">{photo if st.session_state.photo_path else '사진을 스캔 공간에 넣어주세요'}</div></div>
-  <div class="down-mark">⌄</div>
-  <a class="black-pill" href="?action=scan_start{memory_query}" target="_self">스캔 시작하기</a>
-</div>
-""")
-    file = st.file_uploader("사진 선택", type=["jpg", "jpeg", "png"], label_visibility="collapsed")
-    if file:
-        signature = f"{file.name}:{file.size}"
-        if signature == st.session_state.upload_signature:
-            st.stop()
-        st.session_state.upload_signature = signature
-        save_photo(file)
-        st.rerun()
-
-elif page == "scan_running":
-    progress_area = st.empty()
-    for percent in range(0, 101, 4):
-        photo = photo_markup("photo-fill scan-blur")
-        progress_area.markdown(f"""
-<div class="app-card flow">
-  <div class="topbar"><a class="back" href="?action=back" target="_self">‹</a><div class="center">{FLOW_LOGO_HTML}</div><div class="guide">가이드</div></div>
-  <div class="scan-card"><div class="scan-frame">{photo}<div class="scan-line live" style="--scan-y:{percent}%"></div><div class="scan-label">스캔중...</div></div></div>
-  <div class="scan-progress-row"><div class="scan-progress-track"><div class="scan-progress-fill" style="width:{percent}%"></div></div><div>{percent}%</div></div>
-  <div class="down-mark">⌄</div>
-  <div class="black-pill">스캔 시작하기</div>
-</div>
-""", unsafe_allow_html=True)
-        time.sleep(0.09)
-    update_photo_analysis()
-    go("analyzing")
-
-elif page == "analyzing":
-    src = image_src(st.session_state.photo_path)
-    img = f'<img src="{src}">' if src else ""
-    k1, k2, k3 = st.session_state.keywords
-    html(f"""
-<div class="app-card flow">
-  <div class="topbar"><a class="back" href="?action=back" target="_self">‹</a><div class="center">{FLOW_LOGO_HTML}</div><div class="guide">가이드</div></div>
-  <div class="analysis-wrap">
-    <div class="photo-paper">
-      {img}
-      <div class="keyword kw-left">{k1}</div>
-      <div class="keyword kw-top">{k2}</div>
-      <div class="keyword kw-right">{k3}</div>
-    </div>
-    <div class="analysis-title">AI가 추억을 분석하고 있어요</div>
-    <div class="analysis-sub">잠시만 기다려주세요</div>
-    <div class="progress-row"><div class="progress-track"><div class="progress-fill"></div><div class="progress-dot"></div></div><div>100%</div></div>
-  </div>
-</div>
-""")
-    time.sleep(2.4)
-    go("scan_done")
-
-elif page == "scan_done":
-    src = image_src(st.session_state.photo_path)
-    img = f'<img src="{src}">' if src else ""
-    memory_query = f"&memory={st.session_state.memory_id}" if st.session_state.memory_id else ""
-    questions = st.session_state.get("questions") or [st.session_state.question]
-    question_cards = "".join(
-        f'<div class="question-card">{escape(question)}</div>'
-        for question in questions[:3]
-    )
-    html(f"""
-<div class="app-card flow">
-  <div class="topbar"><a class="back" href="?action=back" target="_self">‹</a><div class="center">{FLOW_LOGO_HTML}</div><div class="guide">가이드</div></div>
-  <div class="done-grid">
-    <div>
-      <div class="done-title">사진 스캔이 완료되었어요!</div>
-      <div class="done-sub">사진을 분석했어요. 이제 진짜 추억을 이야기해볼까요?</div>
-      <div class="done-panel"><div class="photo-paper">{img}</div></div>
-    </div>
-    <div>
-      <div class="done-title">AI가 추억을 되살릴 질문을 준비했어요</div>
-      <div class="done-sub">이제 질문을 보며 기억을 떠올려 보세요</div>
-      <div class="done-panel">{question_cards}</div>
-    </div>
-  </div>
-  <a class="wide-black" href="?action=write{memory_query}" target="_self">기록 시작하기<small>이제 추억을 기록해볼까요?</small></a>
-</div>
-""")
-
-elif page == "write":
-    # 기록 화면: 왼쪽 사진/AI 요약 + 오른쪽 손글씨 패드
-    if not st.session_state.photo_path and st.session_state.memory_id:
-        restore_photo(st.session_state.memory_id)
-
-    if "pen_color" not in st.session_state:
-        st.session_state.pen_color = "#000000"
-    if st.session_state.write_mode not in ("voice", "chat", "handwriting"):
-        st.session_state.write_mode = "handwriting"
-    selected_pen_name = {
-        "#000000": "black",
-        "#1e88e5": "blue",
-        "#44c767": "green",
-        "#f8c51b": "yellow",
-        "#f34b3f": "red",
-    }.get(st.session_state.get("pen_color", "#000000").lower(), "black")
-
-    st.markdown("""
 <style>
-.stApp { background:#efefef !important; }
-.block-container {
-    max-width: 800px !important;
-    min-height: 544px !important;
-    margin: 0 auto !important;
-    padding: 30px 28px 28px !important;
-    background:
-      radial-gradient(circle at 0% 88%, rgba(239,90,40,.22), transparent 34%),
-      radial-gradient(circle at 100% 50%, rgba(239,90,40,.14), transparent 38%),
-      #fffaf7 !important;
-    box-shadow: 0 18px 42px rgba(0,0,0,.045) !important;
-    overflow: hidden !important;
-    position: relative !important;
-}
-header, [data-testid="stToolbar"], [data-testid="stDecoration"], #MainMenu, footer { display:none !important; }
-div[data-testid="stVerticalBlock"] { gap:.34rem !important; }
-div[data-testid="stHorizontalBlock"] { gap:1.0rem !important; }
-.write-topbar { display:grid; grid-template-columns:38px 1fr 300px; align-items:center; margin-bottom:8px; }
-.write-back { width:38px; height:38px; border-radius:50%; background:#f1f1f1; display:flex; align-items:center; justify-content:center; color:#0b67b2; font-size:28px; font-weight:900; text-decoration:none; }
-.write-handle { width:24px; height:3px; border-radius:999px; background:#cfc7c2; justify-self:center; }
-.write-title-dot { display:flex; align-items:center; gap:7px; font-size:11px; font-weight:900; color:#111; margin:0 0 20px 0; }
-.write-title-dot span { width:6px; height:6px; border-radius:50%; background:#ef5a28; display:inline-block; }
-.era-chip { display:inline-flex; align-items:center; gap:6px; height:28px; padding:0 14px; border-radius:999px; background:#fff; box-shadow:0 8px 18px rgba(0,0,0,.07); color:#222; font-size:9px; font-weight:900; margin-bottom:25px; }
-.record-photo-card { width:100%; height:286px; background:#fff; border-radius:24px; display:flex; align-items:center; justify-content:center; overflow:hidden; box-shadow:0 14px 30px rgba(0,0,0,.06); padding:15px; }
-.record-photo-card img { width:100%; height:100%; object-fit:contain; display:block; filter:saturate(.72) contrast(.94); }
-.ai-summary-card { margin-top:28px; width:170px; min-height:70px; border-radius:12px; background:rgba(255,255,255,.82); box-shadow:0 10px 24px rgba(0,0,0,.045); padding:11px 13px; font-size:8px; line-height:1.55; color:#222; }
-.ai-summary-title { font-size:10px; font-weight:900; margin-bottom:7px; color:#111; }
-.ai-summary-title span { color:#ef5a28; }
-.mode-link-row { min-height:33px; }
-.st-key-write_back_button { position:absolute !important; left:28px !important; top:30px !important; width:38px !important; z-index:20 !important; }
-.st-key-write_back_button button { width:38px !important; height:38px !important; padding:0 !important; border:0 !important; border-radius:50% !important; background:#f1f1f1 !important; color:#0b67b2 !important; box-shadow:none !important; font-size:28px !important; font-weight:900 !important; line-height:1 !important; }
-.st-key-write_mode_voice_button,
-.st-key-write_mode_chat_button,
-.st-key-write_mode_handwriting_button { position:absolute !important; top:30px !important; z-index:20 !important; width:84px !important; }
-.st-key-write_mode_voice_button { right:212px !important; }
-.st-key-write_mode_chat_button { right:120px !important; }
-.st-key-write_mode_handwriting_button { right:28px !important; }
-.st-key-write_mode_voice_button button,
-.st-key-write_mode_chat_button button,
-.st-key-write_mode_handwriting_button button { width:84px !important; min-width:84px !important; height:33px !important; padding:0 10px !important; border:0 !important; border-radius:999px !important; background:#fff !important; color:#111 !important; box-shadow:0 8px 20px rgba(0,0,0,.075) !important; font-size:11px !important; font-weight:900 !important; }
-.pad-card { height:418px; border-radius:14px; background:#fff; box-shadow:0 14px 32px rgba(0,0,0,.14); border:1px solid #e9e9e9; padding:14px; overflow:hidden; }
-div[data-testid="stCustomComponentV1"]:has(iframe[title*="streamlit_drawable_canvas"]),
-.element-container:has(iframe[title*="streamlit_drawable_canvas"]) {
-    height:412px !important;
-    max-height:412px !important;
-    overflow:hidden !important;
-}
-iframe[title*="streamlit_drawable_canvas"] {
-    width:376px !important;
-    max-width:100% !important;
-    height:412px !important;
+html,
+body,
+.stApp,
+.stApp [data-testid="stAppViewContainer"],
+.stApp [data-testid="stMain"],
+.stApp [data-testid="stMainBlockContainer"] {{
+    width:100vw !important;
+    height:100vh !important;
+    min-height:100vh !important;
+    max-height:100vh !important;
     margin:0 !important;
-    position:static !important;
-    z-index:auto !important;
-    border-radius:14px !important;
-    border:1px solid #e5e5e5 !important;
-    box-shadow:0 14px 32px rgba(0,0,0,.14) !important;
-    background:#fff !important;
-}
-.color-toolbar-title {
-    width:34px;
-    height:44px;
+    overflow:hidden !important;
+}}
+*::-webkit-scrollbar {{
+    display:none !important;
+    width:0 !important;
+    height:0 !important;
+}}
+* {{
+    scrollbar-width:none !important;
+}}
+.stApp {{ background:#7c7c7a !important; }}
+.stApp .block-container {{
+    width:min(1180px, calc(100vw - 32px)) !important;
+    max-width:min(1180px, calc(100vw - 32px)) !important;
+    height:min(760px, calc(100vh - 32px)) !important;
+    min-height:min(760px, calc(100vh - 32px)) !important;
+    max-height:min(760px, calc(100vh - 32px)) !important;
+    margin:16px auto !important;
+    padding:34px 56px 74px !important;
+    background:
+      radial-gradient(circle at 50% 60%, rgba(255,126,45,.10), transparent 34%),
+      #fafafa !important;
+    overflow:hidden !important;
+    border-radius:32px !important;
+}}
+header, [data-testid="stToolbar"], [data-testid="stDecoration"], #MainMenu, footer {{ display:none !important; }}
+div[data-testid="stVerticalBlock"] {{ gap:0 !important; }}
+.scan-page-title {{
+    display:none !important;
+}}
+.scan-upload-topbar {{
+    display:flex;
+    align-items:center;
+    justify-content:flex-end;
+    min-height:42px;
+    margin-bottom:64px;
+}}
+.scan-upload-guide {{
+    height:38px;
+    min-width:82px;
+    padding:0 16px;
+    border-radius:999px;
+    background:#fff;
+    box-shadow:0 8px 18px rgba(0,0,0,.10);
     display:flex;
     align-items:center;
     justify-content:center;
+    gap:7px;
     font-size:13px;
-    margin:0 0 82px 0;
     color:#111;
-    border-bottom:1px solid #e9e9e9;
+    font-weight:900;
+}}
+.scan-upload-guide .guide-icon {{
+    width:13px;
+    height:13px;
+    display:inline-block;
+    border:2px solid #111;
+    border-radius:3px;
     position:relative;
-    z-index:4;
-}
-div[data-testid="stHorizontalBlock"]:has(iframe[title*="streamlit_drawable_canvas"]) > div[data-testid="column"]:last-child:not(:has(iframe[title*="streamlit_drawable_canvas"])) {
-    flex:0 0 34px !important;
-    width:34px !important;
-    min-width:34px !important;
-    max-width:34px !important;
-    margin-left:-40px !important;
-    position:relative !important;
-    z-index:8 !important;
-}
-div[data-testid="stHorizontalBlock"]:has(iframe[title*="streamlit_drawable_canvas"]) > div[data-testid="column"]:last-child:not(:has(iframe[title*="streamlit_drawable_canvas"])) div[data-testid="stVerticalBlock"] {
-    width:34px !important;
-    min-width:34px !important;
-    max-width:34px !important;
-    height:300px !important;
-    min-height:300px !important;
-    border-radius:999px !important;
+}}
+.scan-upload-guide .guide-icon::after {{
+    content:"";
+    position:absolute;
+    left:50%;
+    top:2px;
+    bottom:2px;
+    width:1.5px;
+    background:#111;
+    transform:translateX(-50%);
+}}
+.stApp .st-key-scan_photo_uploader {{
+    width:min(690px, 66vw) !important;
+    max-width:690px !important;
+    height:350px !important;
+    min-height:350px !important;
+    max-height:350px !important;
+    margin:0 auto !important;
+    padding:22px 26px !important;
+    border-radius:18px !important;
     background:#fff !important;
-    border:1px solid #ededed !important;
-    box-shadow:0 8px 16px rgba(0,0,0,.12) !important;
-    display:flex !important;
-    flex-direction:column !important;
-    align-items:center !important;
-    justify-content:flex-start !important;
-    gap:0 !important;
-    padding:9px 0 14px !important;
-    margin-top:66px !important;
-    overflow:hidden !important;
-}
-.st-key-pen_color_black,
-.st-key-pen_color_blue,
-.st-key-pen_color_green,
-.st-key-pen_color_yellow,
-.st-key-pen_color_red {
-    width:34px !important;
-    height:22px !important;
-    min-height:22px !important;
-    margin:0 auto !important;
+    box-shadow:0 18px 42px rgba(255,126,45,.12) !important;
     display:flex !important;
     align-items:center !important;
     justify-content:center !important;
     position:relative !important;
-    z-index:5 !important;
-    padding:0 !important;
-}
-.st-key-pen_color_black > div,
-.st-key-pen_color_blue > div,
-.st-key-pen_color_green > div,
-.st-key-pen_color_yellow > div,
-.st-key-pen_color_red > div,
-.st-key-pen_color_black div[data-testid="stButton"],
-.st-key-pen_color_blue div[data-testid="stButton"],
-.st-key-pen_color_green div[data-testid="stButton"],
-.st-key-pen_color_yellow div[data-testid="stButton"],
-.st-key-pen_color_red div[data-testid="stButton"] {
-    width:12px !important;
-    height:12px !important;
-    min-width:12px !important;
-    min-height:12px !important;
-    display:flex !important;
-    align-items:center !important;
-    justify-content:center !important;
-    margin:0 auto !important;
-    padding:0 !important;
-}
-.st-key-pen_color_black button,
-.st-key-pen_color_blue button,
-.st-key-pen_color_green button,
-.st-key-pen_color_yellow button,
-.st-key-pen_color_red button {
-    width:12px !important;
-    height:12px !important;
-    min-width:12px !important;
-    min-height:12px !important;
+    overflow:visible !important;
+}}
+.st-key-scan_photo_uploader::after {{
+    content:"";
+    position:absolute;
+    left:50%;
+    top:58%;
+    width:28px;
+    height:28px;
+    transform:translate(-50%, -50%);
+    background:
+      linear-gradient(#ff7b2d, #ff7b2d) left top / 11px 2px no-repeat,
+      linear-gradient(#ff7b2d, #ff7b2d) left top / 2px 11px no-repeat,
+      linear-gradient(#ff7b2d, #ff7b2d) right top / 11px 2px no-repeat,
+      linear-gradient(#ff7b2d, #ff7b2d) right top / 2px 11px no-repeat,
+      linear-gradient(#ff7b2d, #ff7b2d) left bottom / 11px 2px no-repeat,
+      linear-gradient(#ff7b2d, #ff7b2d) left bottom / 2px 11px no-repeat,
+      linear-gradient(#ff7b2d, #ff7b2d) right bottom / 11px 2px no-repeat,
+      linear-gradient(#ff7b2d, #ff7b2d) right bottom / 2px 11px no-repeat;
+    pointer-events:none;
+    z-index:35;
+    {scan_icon_display}
+}}
+.stApp .st-key-scan_photo_uploader div[data-testid="stFileUploader"] {{
+    width:100% !important;
+    max-width:100% !important;
+    height:306px !important;
+    min-height:306px !important;
+    max-height:306px !important;
+    margin:0 !important;
+    opacity:1 !important;
+    position:static !important;
+    z-index:20 !important;
+}}
+.stApp .st-key-scan_photo_uploader section,
+.stApp .st-key-scan_photo_uploader [data-testid="stFileUploaderDropzone"] {{
+    width:100% !important;
+    height:306px !important;
+    min-height:306px !important;
+    max-height:306px !important;
+    margin:0 !important;
     padding:0 !important;
     border:0 !important;
-    border-radius:50% !important;
-    box-shadow:none !important;
-    color:transparent !important;
+    border-radius:4px !important;
+    background-color:#f0f0f0 !important;
+    {photo_background}
+    background-size:contain !important;
+    background-position:center !important;
+    background-repeat:no-repeat !important;
+    cursor:pointer !important;
+    position:relative !important;
     overflow:hidden !important;
-    line-height:1 !important;
-    margin:0 !important;
-    display:block !important;
-}
-.st-key-pen_color_black button > div,
-.st-key-pen_color_blue button > div,
-.st-key-pen_color_green button > div,
-.st-key-pen_color_yellow button > div,
-.st-key-pen_color_red button > div {
-    width:12px !important;
-    height:12px !important;
-    min-width:12px !important;
-    min-height:12px !important;
-    margin:0 !important;
-    padding:0 !important;
-}
-.st-key-pen_color_black button { background:#000000 !important; }
-.st-key-pen_color_blue button { background:#1e88e5 !important; }
-.st-key-pen_color_green button { background:#44c767 !important; }
-.st-key-pen_color_yellow button { background:#f8c51b !important; }
-.st-key-pen_color_red button { background:#f34b3f !important; }
-.st-key-pen_color_black button p,
-.st-key-pen_color_blue button p,
-.st-key-pen_color_green button p,
-.st-key-pen_color_yellow button p,
-.st-key-pen_color_red button p {
-    font-size:0 !important;
-    line-height:0 !important;
+    box-shadow:none !important;
+}}
+.st-key-scan_photo_uploader [data-testid="stFileUploaderDropzone"]::before {{
+    content:"";
+    position:absolute;
+    inset:14px;
+    border:2px solid #bdbdbd;
+    border-radius:0;
+    clip-path:polygon(
+        0 0, 34px 0, 34px 2px, 2px 2px, 2px 34px, 0 34px,
+        0 100%, 34px 100%, 34px calc(100% - 2px), 2px calc(100% - 2px), 2px calc(100% - 34px), 0 calc(100% - 34px),
+        100% 100%, calc(100% - 34px) 100%, calc(100% - 34px) calc(100% - 2px), calc(100% - 2px) calc(100% - 2px), calc(100% - 2px) calc(100% - 34px), 100% calc(100% - 34px),
+        100% 0, calc(100% - 34px) 0, calc(100% - 34px) 2px, calc(100% - 2px) 2px, calc(100% - 2px) 34px, 100% 34px
+    );
+    pointer-events:none;
+    z-index:2;
+}}
+.st-key-scan_photo_uploader [data-testid="stFileUploaderDropzone"]::after {{
+    content:"{scan_hint}";
+    position:absolute;
+    left:0;
+    right:0;
+    top:50%;
+    height:24px;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    color:#111;
+    font-size:15px;
+    font-weight:800;
+    transform:translateY(-34px);
+    pointer-events:none;
+    z-index:3;
+}}
+.st-key-scan_photo_uploader [data-testid="stFileUploaderDropzone"] * {{
+    opacity:0 !important;
+    color:transparent !important;
+    background:transparent !important;
+    border:0 !important;
+    box-shadow:none !important;
+    pointer-events:none !important;
+}}
+.st-key-scan_photo_uploader [data-testid="stFileUploaderDropzone"] button,
+.st-key-scan_photo_uploader [data-testid="stFileUploaderDropzone"] [role="button"] {{
     width:0 !important;
     height:0 !important;
+    min-width:0 !important;
+    min-height:0 !important;
+    padding:0 !important;
+    margin:0 !important;
+    overflow:hidden !important;
+}}
+.st-key-scan_photo_uploader input[type="file"] {{
+    position:absolute !important;
+    inset:0 !important;
+    display:block !important;
+    width:100% !important;
+    height:100% !important;
+    opacity:0 !important;
+    cursor:pointer !important;
+    z-index:30 !important;
+    pointer-events:auto !important;
+}}
+.st-key-scan_photo_uploader label,
+.st-key-scan_photo_uploader small,
+.st-key-scan_photo_uploader [data-testid="stFileUploaderFile"],
+.st-key-scan_photo_uploader [data-testid="stFileUploaderFileData"] {{
+    display:none !important;
+}}
+.scan-upload-down {{
+    display:none;
+}}
+.stApp .st-key-scan_start_button {{
+    width:330px !important;
+    margin:52px auto 0 !important;
+}}
+.stApp .st-key-scan_start_button button {{
+    width:100% !important;
+    height:76px !important;
+    min-height:76px !important;
+    border-radius:8px !important;
+    border:0 !important;
+    background:#050505 !important;
+    color:#fff !important;
+    box-shadow:0 16px 26px rgba(0,0,0,.24) !important;
+    font-size:22px !important;
+    font-weight:1000 !important;
+    display:flex !important;
+    align-items:center !important;
+    justify-content:center !important;
+}}
+.stApp .st-key-scan_start_button button::before {{
+    content:"";
+    width:24px;
+    height:20px;
+    margin-right:44px;
+    border:2px solid #ff7b2d;
+    border-radius:5px;
+    background:
+      radial-gradient(circle at 50% 55%, transparent 0 4px, #ff7b2d 4px 5.5px, transparent 5.5px),
+      linear-gradient(#ff7b2d, #ff7b2d) 50% -2px / 10px 5px no-repeat;
+    display:inline-block;
+    box-sizing:border-box;
+}}
+@media (max-width:900px) {{
+    .stApp .block-container {{
+        width:min(900px, calc(100vw - 24px)) !important;
+        max-width:min(900px, calc(100vw - 24px)) !important;
+        height:min(640px, calc(100vh - 24px)) !important;
+        min-height:min(640px, calc(100vh - 24px)) !important;
+        max-height:min(640px, calc(100vh - 24px)) !important;
+        margin:12px auto !important;
+        padding:28px 38px 64px !important;
+    }}
+    .scan-page-title {{ left:14px; }}
+    .scan-upload-topbar {{ margin-bottom:50px; }}
+    .stApp .st-key-scan_photo_uploader {{
+        width:min(600px, 74vw) !important;
+        height:320px !important;
+        min-height:320px !important;
+        max-height:320px !important;
+        padding:20px 22px !important;
+    }}
+    .stApp .st-key-scan_photo_uploader div[data-testid="stFileUploader"],
+    .stApp .st-key-scan_photo_uploader section,
+    .stApp .st-key-scan_photo_uploader [data-testid="stFileUploaderDropzone"] {{
+        height:280px !important;
+        min-height:280px !important;
+        max-height:280px !important;
+    }}
+}}
+@media (max-width:640px) {{
+    .stApp .block-container {{
+        width:100vw !important;
+        max-width:100vw !important;
+        height:520px !important;
+        min-height:520px !important;
+        max-height:520px !important;
+        margin:0 auto !important;
+        padding:24px 24px 56px !important;
+    }}
+    .scan-upload-topbar {{ margin-bottom:36px; }}
+    .stApp .st-key-scan_photo_uploader {{
+        width:calc(100vw - 84px) !important;
+        max-width:520px !important;
+        height:290px !important;
+        min-height:290px !important;
+        max-height:290px !important;
+        padding:18px !important;
+        border-radius:13px !important;
+    }}
+    .stApp .st-key-scan_photo_uploader div[data-testid="stFileUploader"],
+    .stApp .st-key-scan_photo_uploader section,
+    .stApp .st-key-scan_photo_uploader [data-testid="stFileUploaderDropzone"] {{
+        height:254px !important;
+        min-height:254px !important;
+        max-height:254px !important;
+    }}
+    .stApp .st-key-scan_start_button {{
+        width:250px !important;
+        margin-top:38px !important;
+    }}
+    .stApp .st-key-scan_start_button button {{
+        height:60px !important;
+        min-height:60px !important;
+        font-size:18px !important;
+    }}
+}}
+</style>
+<div class="scan-page-title">AI 사진 분석</div>
+<div class="scan-upload-topbar">
+  <div class="scan-upload-guide"><span class="guide-icon"></span>가이드</div>
+</div>
+""")
+    file = st.file_uploader(
+        "사진 선택",
+        type=["jpg", "jpeg", "png"],
+        label_visibility="collapsed",
+        key="scan_photo_uploader",
+    )
+    if file:
+        signature = f"{file.name}:{file.size}"
+        if signature != st.session_state.upload_signature:
+            st.session_state.upload_signature = signature
+            st.session_state.scan_upload_notice = ""
+            st.session_state.analysis_done = False
+            st.session_state.suggested_categories = []
+            st.session_state.music_query = ""
+            save_photo(file)
+            st.rerun()
+    html('<div class="scan-upload-down">▢</div>')
+    if st.button("스캔하기", key="scan_start_button"):
+        if media_reference_available(st.session_state.get("photo_path")):
+            go("scan_running")
+        else:
+            st.session_state.scan_upload_notice = "사진을 먼저 선택해주세요."
+    if st.session_state.get("scan_upload_notice"):
+        st.warning(st.session_state.scan_upload_notice)
+
+elif page == "scan_running":
+    # 스캔 중에도 화면 비율이 바뀌지 않도록 scan_upload 화면과 같은 틀을 그대로 사용한다.
+    # 업로더만 숨기고, 같은 스캔 영역 안에서 사진이 스캔되는 것처럼 보이게 처리한다.
+    html("""
+<style>
+html,
+body,
+.stApp,
+.stApp [data-testid="stAppViewContainer"],
+.stApp [data-testid="stMain"],
+.stApp [data-testid="stMainBlockContainer"] {
+    width:100vw !important;
+    height:100vh !important;
+    min-height:100vh !important;
+    max-height:100vh !important;
+    margin:0 !important;
     overflow:hidden !important;
 }
-.record-next { width:104px; margin:9px 0 0 auto; }
-.record-next button { height:34px !important; border-radius:999px !important; border:0 !important; background:#fff !important; color:#111 !important; box-shadow:0 10px 22px rgba(0,0,0,.12) !important; font-size:14px !important; font-weight:800 !important; }
-.record-save { width:156px; margin:8px 0 0 auto; }
-.record-save button { height:32px !important; border-radius:999px !important; border:0 !important; background:#fff !important; color:#111 !important; box-shadow:0 8px 18px rgba(0,0,0,.10) !important; font-size:12px !important; font-weight:900 !important; }
-.text-record-card textarea { min-height:356px !important; border:0 !important; box-shadow:none !important; background:#fff !important; font-size:15px !important; line-height:1.6 !important; }
-.voice-record-box { height:372px; border-radius:13px; background:#fff; box-shadow:0 14px 32px rgba(0,0,0,.12); display:flex; flex-direction:column; align-items:center; justify-content:center; color:#555; text-align:center; gap:10px; }
-.voice-record-icon { width:56px; height:56px; border-radius:50%; background:#fff3ec; display:flex; align-items:center; justify-content:center; font-size:25px; color:#ef5a28; }
-@media (max-width: 820px) {
-  .block-container { max-width: 790px !important; min-height:544px !important; padding:24px 28px 24px !important; }
-  .write-topbar { grid-template-columns:42px 1fr 300px; }
-  .record-photo-card { height:250px; }
-  .pad-card { height:350px; }
-  div[data-testid="stCustomComponentV1"]:has(iframe[title*="streamlit_drawable_canvas"]),
-  .element-container:has(iframe[title*="streamlit_drawable_canvas"]) { height:392px !important; max-height:392px !important; }
-  iframe[title*="streamlit_drawable_canvas"] { width:360px !important; height:392px !important; }
-  div[data-testid="stHorizontalBlock"]:has(iframe[title*="streamlit_drawable_canvas"]) > div[data-testid="column"]:last-child:not(:has(iframe[title*="streamlit_drawable_canvas"])) { margin-left:-36px !important; }
-  div[data-testid="stHorizontalBlock"]:has(iframe[title*="streamlit_drawable_canvas"]) > div[data-testid="column"]:last-child:not(:has(iframe[title*="streamlit_drawable_canvas"])) div[data-testid="stVerticalBlock"] { height:284px !important; min-height:284px !important; }
-  .st-key-pen_color_black,
-  .st-key-pen_color_blue,
-  .st-key-pen_color_green,
-  .st-key-pen_color_yellow,
-  .st-key-pen_color_red { margin-left:auto !important; margin-right:auto !important; }
+*::-webkit-scrollbar {
+    display:none !important;
+    width:0 !important;
+    height:0 !important;
+}
+* {
+    scrollbar-width:none !important;
+}
+.stApp {
+    background:#7c7c7a !important;
+    color:#111 !important;
+}
+.stApp .block-container {
+    width:min(1180px, calc(100vw - 32px)) !important;
+    max-width:min(1180px, calc(100vw - 32px)) !important;
+    height:min(760px, calc(100vh - 32px)) !important;
+    min-height:min(760px, calc(100vh - 32px)) !important;
+    max-height:min(760px, calc(100vh - 32px)) !important;
+    margin:16px auto !important;
+    padding:34px 56px 74px !important;
+    background:
+      radial-gradient(circle at 50% 60%, rgba(255,126,45,.10), transparent 34%),
+      #fafafa !important;
+    overflow:hidden !important;
+    border-radius:32px !important;
+    position:relative !important;
+}
+header, [data-testid="stToolbar"], [data-testid="stDecoration"], #MainMenu, footer {
+    display:none !important;
+}
+div[data-testid="stVerticalBlock"] {
+    gap:0 !important;
+}
+
+/* scan_running: 이전 scan_upload 잔상 제거 */
+div[data-testid="stFileUploader"],
+div[data-testid="stFileUploaderDropzone"],
+[data-testid="stFileUploaderDropzone"],
+[data-testid="stFileUploaderFile"],
+.st-key-scan_photo_uploader,
+.st-key-scan_photo_uploader *,
+.st-key-scan_start_button,
+.st-key-scan_start_button *,
+.scan-upload-button-shell,
+.scan-upload-button-shell *,
+.scan-upload-button-shell button,
+button[kind="secondaryFormSubmit"] {
+    display:none !important;
+    visibility:hidden !important;
+    opacity:0 !important;
+    width:0 !important;
+    height:0 !important;
+    min-width:0 !important;
+    min-height:0 !important;
+    max-width:0 !important;
+    max-height:0 !important;
+    margin:0 !important;
+    padding:0 !important;
+    overflow:hidden !important;
+    pointer-events:none !important;
+    position:absolute !important;
+    left:-9999px !important;
+    top:-9999px !important;
+}
+
+.scan-running-topbar {
+    display:flex;
+    align-items:center;
+    justify-content:flex-end;
+    min-height:42px;
+    margin-bottom:64px;
+}
+.scan-running-guide {
+    height:38px;
+    min-width:82px;
+    padding:0 16px;
+    border-radius:999px;
+    background:#fff;
+    box-shadow:0 8px 18px rgba(0,0,0,.10);
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    gap:7px;
+    font-size:13px;
+    color:#111;
+    font-weight:900;
+}
+.scan-running-guide .guide-icon {
+    width:13px;
+    height:13px;
+    display:inline-block;
+    border:2px solid #111;
+    border-radius:3px;
+    position:relative;
+}
+.scan-running-guide .guide-icon::after {
+    content:"";
+    position:absolute;
+    left:50%;
+    top:2px;
+    bottom:2px;
+    width:1.5px;
+    background:#111;
+    transform:translateX(-50%);
+}
+.scan-running-uploader {
+    width:min(690px, 66vw);
+    max-width:690px;
+    height:350px;
+    min-height:350px;
+    max-height:350px;
+    margin:0 auto;
+    padding:22px 26px;
+    border-radius:18px;
+    background:#fff;
+    box-shadow:0 18px 42px rgba(255,126,45,.12);
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    position:relative;
+    overflow:hidden;
+}
+.scan-running-box {
+    width:100%;
+    height:100%;
+    position:relative;
+    overflow:hidden;
+    background:#f7f7f7;
+}
+.scan-running-box::before,
+.scan-running-box::after {
+    content:"";
+    position:absolute;
+    width:34px;
+    height:34px;
+    border-color:#cfcfcf;
+    z-index:3;
+}
+.scan-running-box::before {
+    left:0;
+    top:0;
+    border-left:2px solid #cfcfcf;
+    border-top:2px solid #cfcfcf;
+}
+.scan-running-box::after {
+    right:0;
+    bottom:0;
+    border-right:2px solid #cfcfcf;
+    border-bottom:2px solid #cfcfcf;
+}
+.scan-running-corner-rt,
+.scan-running-corner-lb {
+    position:absolute;
+    width:34px;
+    height:34px;
+    border-color:#cfcfcf;
+    z-index:3;
+}
+.scan-running-corner-rt {
+    right:0;
+    top:0;
+    border-right:2px solid #cfcfcf;
+    border-top:2px solid #cfcfcf;
+}
+.scan-running-corner-lb {
+    left:0;
+    bottom:0;
+    border-left:2px solid #cfcfcf;
+    border-bottom:2px solid #cfcfcf;
+}
+.scan-running-photo {
+    position:absolute;
+    inset:16px;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    overflow:hidden;
+}
+.scan-running-photo img {
+    width:100%;
+    height:100%;
+    object-fit:cover;
+    filter:blur(6px) saturate(.65);
+    opacity:.82;
+}
+.scan-running-line {
+    position:absolute;
+    left:16px;
+    right:16px;
+    height:3px;
+    background:#ff7b2d;
+    box-shadow:0 0 18px rgba(255,123,45,.85);
+    z-index:4;
+}
+.scan-running-label {
+    position:absolute;
+    left:0;
+    right:0;
+    bottom:-58px;
+    text-align:center;
+    color:#111;
+    font-size:14px;
+    font-weight:1000;
 }
 </style>
+""")
+    progress_area = st.empty()
+    for percent in range(0, 101, 5):
+        photo = image_src(st.session_state.get("photo_path"))
+        img = f'<img src="{photo}">' if photo else ''
+        progress_area.markdown(f"""
+<div class="scan-running-topbar">
+  <div class="scan-running-guide"><span class="guide-icon"></span> 가이드</div>
+</div>
+<div class="scan-running-uploader">
+  <div class="scan-running-box">
+    <div class="scan-running-corner-rt"></div>
+    <div class="scan-running-corner-lb"></div>
+    <div class="scan-running-photo">{img}</div>
+    <div class="scan-running-line" style="top:{percent}%;"></div>
+  </div>
+</div>
+<div class="scan-running-label">스캔중...</div>
 """, unsafe_allow_html=True)
-    st.markdown(f"""
+        time.sleep(0.05)
+    go("scan_done")
+
+elif page == "analyzing":
+    if not media_reference_available(st.session_state.get("photo_path")):
+        go("scan_upload")
+    html("""
 <style>
-.st-key-pen_color_{selected_pen_name} button {{
-    outline:1.5px solid rgba(0,0,0,.32) !important;
-    outline-offset:1px !important;
+html,
+body,
+.stApp,
+.stApp [data-testid="stAppViewContainer"],
+.stApp [data-testid="stMain"],
+.stApp [data-testid="stMainBlockContainer"] {
+    width:100vw !important;
+    height:100vh !important;
+    min-height:100vh !important;
+    max-height:100vh !important;
+    margin:0 !important;
+    overflow:hidden !important;
+}
+*::-webkit-scrollbar {
+    display:none !important;
+    width:0 !important;
+    height:0 !important;
+}
+* {
+    scrollbar-width:none !important;
+}
+.stApp { background:#777 !important; }
+.block-container {
+    max-width:1180px !important;
+    min-height:760px !important;
+    padding:0 !important;
+    background:
+      radial-gradient(circle at 92% 100%, rgba(255,105,33,.10), transparent 36%),
+      #fbfbfb !important;
+    display:flex !important;
+    align-items:center !important;
+    justify-content:center !important;
+    overflow:hidden !important;
+}
+header, [data-testid="stToolbar"], [data-testid="stDecoration"], #MainMenu, footer { display:none !important; }
+div[data-testid="stVerticalBlock"] { width:100% !important; }
+.analysis-wait-text {
+    min-height:620px;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    color:#111;
+    font-size:20px;
+    font-weight:900;
+}
+</style>
+<div class="analysis-wait-text">사진 분석 중..</div>
+""")
+    time.sleep(0.6)
+    update_photo_analysis()
+    go("write")
+
+elif page == "scan_done":
+    if not media_reference_available(st.session_state.get("photo_path")):
+        go("scan_upload")
+    src = image_src(st.session_state.photo_path)
+    img = f'<img src="{src}">' if src else ""
+    html(f"""
+<style>
+html,
+body,
+.stApp,
+.stApp [data-testid="stAppViewContainer"],
+.stApp [data-testid="stMain"],
+.stApp [data-testid="stMainBlockContainer"] {{
+    width:100vw !important;
+    height:100vh !important;
+    min-height:100vh !important;
+    max-height:100vh !important;
+    margin:0 !important;
+    overflow:hidden !important;
 }}
-.st-key-write_mode_{st.session_state.write_mode}_button button {{
+*::-webkit-scrollbar {{
+    display:none !important;
+    width:0 !important;
+    height:0 !important;
+}}
+* {{
+    scrollbar-width:none !important;
+}}
+.stApp {{ background:#777 !important; }}
+.block-container {{
+    max-width:1180px !important;
+    min-height:760px !important;
+    padding:54px 56px 82px !important;
+    background:
+      radial-gradient(circle at 91% 100%, rgba(255,105,33,.12), transparent 38%),
+      #fbfbfb !important;
+    overflow:hidden !important;
+}}
+header, [data-testid="stToolbar"], [data-testid="stDecoration"], #MainMenu, footer {{ display:none !important; }}
+div[data-testid="stVerticalBlock"] {{ gap:0 !important; }}
+.scan-done-title {{
+    text-align:center;
+    color:#111;
+    font-size:20px;
+    font-weight:1000;
+    margin:0 0 52px;
+}}
+.scan-done-card {{
+    width:min(680px, 72%) !important;
+    max-width:680px;
+    margin:0 auto 64px;
+    padding:34px 52px;
+    border-radius:20px;
+    background:#fff;
+    border:1px solid rgba(255,112,37,.22);
+    box-shadow:0 14px 34px rgba(255,112,37,.20);
+}}
+.scan-done-photo {{
+    width:100%;
+    height:clamp(220px, 32dvh, 315px);
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    overflow:hidden;
+    background:#f4f4f4;
+}}
+.scan-done-photo img {{
+    width:100%;
+    height:100%;
+    object-fit:contain;
+    display:block;
+}}
+.scan-done-actions {{
+    width:min(620px, 72%);
+    margin:0 auto;
+}}
+.scan-done-actions div[data-testid="stHorizontalBlock"] {{
+    gap:72px !important;
+}}
+.st-key-rescan_button button,
+.st-key-scan_done_write_button button {{
+    width:100% !important;
+    height:58px !important;
+    min-height:58px !important;
+    border-radius:7px !important;
+    border:0 !important;
+    font-size:14px !important;
+    font-weight:1000 !important;
+    box-shadow:0 10px 22px rgba(0,0,0,.10) !important;
+}}
+.st-key-rescan_button button {{
     background:#050505 !important;
     color:#fff !important;
 }}
+.st-key-scan_done_write_button button {{
+    background:#fff !important;
+    color:#111 !important;
+}}
+.st-key-rescan_button button::before {{
+    content:"▣";
+    margin-right:10px;
+    color:#ff7b2d;
+    font-size:16px;
+}}
+.st-key-scan_done_write_button button::before {{
+    content:"✎";
+    margin-right:10px;
+    color:#111;
+    font-size:15px;
+}}
+@media (max-width:900px) {{
+    .block-container {{ padding:42px 34px 74px !important; }}
+    .scan-done-card {{ width:82% !important; padding:28px 38px; margin-bottom:48px; }}
+    .scan-done-actions {{ width:82%; }}
+    .scan-done-actions div[data-testid="stHorizontalBlock"] {{ gap:42px !important; }}
+}}
+@media (max-width:640px) {{
+    .block-container {{ padding:32px 20px 70px !important; }}
+    .scan-done-title {{ margin-bottom:32px; }}
+    .scan-done-card {{ width:100% !important; padding:20px; margin-bottom:32px; }}
+    .scan-done-actions {{ width:100%; }}
+    .scan-done-actions div[data-testid="stHorizontalBlock"] {{ gap:16px !important; }}
+}}
 </style>
-""", unsafe_allow_html=True)
-
-    write_mode = st.session_state.write_mode
-
-    html(f'''
-<div class="write-topbar">
-  <div></div>
-  <div>{FLOW_LOGO_HTML}</div>
-  <div class="mode-link-row"></div>
+<div class="scan-done-title">스캔 완료!</div>
+<div class="scan-done-card">
+  <div class="scan-done-photo">{img}</div>
 </div>
-''')
-    if st.button("‹", key="write_back_button"):
-        preserve_write_inputs()
-        go("scan_done")
-    st.button("음성 기록", key="write_mode_voice_button", on_click=switch_write_mode, args=("voice",))
-    st.button("텍스트", key="write_mode_chat_button", on_click=switch_write_mode, args=("chat",))
-    st.button("손글씨", key="write_mode_handwriting_button", on_click=switch_write_mode, args=("handwriting",))
+<div class="scan-done-actions">
+""")
+    rescan_col, write_col = st.columns(2)
+    with rescan_col:
+        if st.button("다시 스캔하기", key="rescan_button", use_container_width=True):
+            reset_scan_inputs()
+            go("scan_upload")
+    with write_col:
+        if st.button("기록하기", key="scan_done_write_button", use_container_width=True):
+            go("analyzing")
+    html("</div>")
 
-    left_col, right_col = st.columns([0.48, 0.52])
-
-    src = image_src(st.session_state.photo_path)
-    img = f'<img src="{src}">' if src else '<div style="color:#9aa; font-size:34px;">▧</div>'
-    keywords = st.session_state.get("keywords") or ["추억사진", "인물사진", "옛날 분위기"]
-    questions = st.session_state.get("questions") or [st.session_state.get("question", "이 사진을 찍던 날은 어떤 날이었나요?")]
-    analysis_label = st.session_state.get("analysis_label") or "사진 속 순간"
-    summary_text = f"{analysis_label} 장면으로 보여요. {', '.join(keywords[:2])}의 단서가 느껴집니다. {questions[0]}"
-
-    with left_col:
-        html(f'''
-<div class="write-title-dot"><span></span>기록 중</div>
-<div class="era-chip">▣ {escape(analysis_label)}</div>
-<div class="record-photo-card">{img}</div>
-<div class="ai-summary-card">
-  <div class="ai-summary-title"><span>✦</span> AI 분석 요약</div>
-  {escape(summary_text)}
-</div>
-''')
-
-    canvas_result = None
-    with right_col:
-        if write_mode == "handwriting":
-            canvas_key = current_canvas_key()
-            canvas_state = st.session_state.get(canvas_key)
-            if isinstance(canvas_state, dict) and canvas_state.get("raw"):
-                st.session_state.handwriting_json = canvas_state["raw"]
-            canvas_col, tool_col = st.columns([0.92, 0.08])
-            with canvas_col:
-                canvas_result = st_canvas(
-                    fill_color="rgba(255, 255, 255, 0)",
-                    stroke_width=3,
-                    stroke_color=st.session_state.get("pen_color", "#000000"),
-                    background_color="#ffffff",
-                    height=412,
-                    width=376,
-                    drawing_mode="freedraw",
-                    initial_drawing=st.session_state.get("handwriting_json"),
-                    update_streamlit=True,
-                    display_toolbar=False,
-                    key=canvas_key,
-                )
-                if canvas_result is not None:
-                    if canvas_result.json_data:
-                        st.session_state.handwriting_json = canvas_result.json_data
-                    if canvas_has_ink(canvas_result.image_data):
-                        save_handwriting(canvas_result.image_data)
-            with tool_col:
-                colors = [
-                    (" ", "#000000", "black"),
-                    (" ", "#1e88e5", "blue"),
-                    (" ", "#44c767", "green"),
-                    (" ", "#f8c51b", "yellow"),
-                    (" ", "#f34b3f", "red"),
-                ]
-                st.markdown('<div class="color-toolbar-title">✎</div>', unsafe_allow_html=True)
-                for label, hex_color, name in colors:
-                    st.button(
-                        label,
-                        key=f"pen_color_{name}",
-                        on_click=set_pen_color,
-                        args=(hex_color, canvas_key),
-                    )
-        elif write_mode == "voice":
-            html('''
-<div class="voice-record-box">
-  <div class="voice-record-icon">●</div>
-  <div style="font-weight:900; font-size:16px;">음성 기록</div>
-  <div style="font-size:12px; line-height:1.55; color:#777;">녹음한 목소리를 텍스트 기록으로 변환해요.</div>
-</div>
-''')
-            voice_file = st.audio_input("음성 기록", label_visibility="collapsed")
-            if voice_file:
-                st.audio(voice_file)
-                if st.button("텍스트로 변환하기", key="transcribe_voice_record", use_container_width=True):
-                    text = transcribe_audio(voice_file)
-                    if text:
-                        st.session_state.memory_text = text
-                        st.success("음성 기록이 텍스트로 변환됐어요.")
-                    else:
-                        st.warning("음성을 텍스트로 변환하지 못했어요.")
-            if st.session_state.memory_text:
-                st.session_state.memory_text = st.text_area(
-                    "변환된 텍스트",
-                    value=st.session_state.memory_text,
-                    key="voice_transcript_preview",
-                    label_visibility="collapsed",
-                    height=96,
-                )
-        else:
-            st.markdown('<div class="pad-card text-record-card">', unsafe_allow_html=True)
-            st.session_state.memory_text = st.text_area(
-                "텍스트 입력",
-                value=st.session_state.memory_text,
-                placeholder="이 사진에 대한 기억을 적어주세요.",
-                label_visibility="collapsed",
-                key="memory_text_area_record",
-            )
-            st.markdown('</div>', unsafe_allow_html=True)
-
-        _, next_col = st.columns([0.72, 0.28])
-        with next_col:
-            if st.button("다음으로", key="write_next_record", use_container_width=True):
-                preserve_write_inputs()
-                if write_mode == "handwriting" and canvas_result is not None:
-                    if canvas_has_ink(canvas_result.image_data):
-                        save_handwriting(canvas_result.image_data)
-                    if canvas_result.json_data:
-                        st.session_state.handwriting_json = canvas_result.json_data
-                go("music")
-
-elif page == "music":
-    # 패드 시연용 음악 선택 화면: 한 카드 안에서 사진/LP + 검색/추천/선택/저장을 모두 처리
-    if not st.session_state.photo_path and st.session_state.memory_id:
+elif page == "write":
+    # 기능 우선: 기존 HTML 가짜 버튼/복잡한 CSS를 쓰지 않고 실제 st.button으로만 작동하는 안정 버전
+    if not media_reference_available(st.session_state.get("photo_path")) and st.session_state.get("memory_id"):
         restore_photo(st.session_state.memory_id)
 
-    if not st.session_state.spotify_tracks:
-        base_query = photo_music_query()
-        st.session_state.spotify_tracks = spotify_recommendations(base_query)
+    photo_path = active_photo_path(st.session_state.get("play_memory") or {}) or st.session_state.get("photo_path")
+    if not media_reference_available(photo_path):
+        st.session_state.page = "scan_upload"
+        st.rerun()
 
-    st.markdown("""
+    if media_reference_available(photo_path) and not st.session_state.get("analysis_done"):
+        update_photo_analysis()
+
+    questions = st.session_state.get("questions") or fallback_photo_analysis()["questions"]
+    if len(questions) < 3:
+        questions = (questions + fallback_photo_analysis()["questions"])[:3]
+    questions = questions[:3]
+
+    idx = int(st.session_state.get("current_question_index", 0) or 0)
+    idx = max(0, min(len(questions) - 1, idx))
+    st.session_state.current_question_index = idx
+
+    mode = st.session_state.get("write_mode", "handwriting")
+    if mode == "chat":
+        mode = "text"
+    if mode not in ("handwriting", "voice", "text"):
+        mode = "handwriting"
+    st.session_state.write_mode = mode
+
+    answers = ensure_question_answers()
+    answer_key = f"question_answer_{idx}"
+    if answer_key not in st.session_state:
+        st.session_state[answer_key] = answers.get(str(idx), "")
+
+    question = str(questions[idx])
+    progress_width = int(((idx + 1) / max(len(questions), 1)) * 100)
+    is_last_question = idx >= len(questions) - 1
+
+    pen_color = st.session_state.get("pen_color", "#000000")
+    pen_width = int(st.session_state.get("stroke_width", st.session_state.get("pen_width", 3)) or 3)
+    st.session_state.pen_width = pen_width
+    st.session_state.stroke_width = pen_width
+    drawing_tool = st.session_state.get("drawing_tool", "pen")
+    stroke_color = "#ffffff" if drawing_tool == "eraser" else pen_color
+    stroke_width = max(pen_width * 4, 18) if drawing_tool == "eraser" else pen_width
+    canvas_key = write_canvas_key(idx)
+
+    color_name = {
+        "#000000": "검정",
+        "#1e88e5": "파랑",
+        "#44c767": "초록",
+        "#f8c51b": "노랑",
+        "#ff4a3d": "빨강",
+    }.get(str(pen_color).lower(), "선택 색")
+
+    html("""
 <style>
-/* 음악 선택 화면 전용: 기존 앱처럼 회색 바깥 + 흰 네모 카드 안에 압축 배치 */
-.stApp { background:#efefef !important; }
-.block-container {
-    max-width: 980px !important;
-    min-height: 610px !important;
-    margin: 18px auto 0 !important;
-    padding: 22px 36px 34px !important;
-    background: radial-gradient(circle at 92% 104%, rgba(239,90,40,.18), transparent 35%), #ffffff !important;
-    box-shadow: 0 18px 42px rgba(0,0,0,.055) !important;
-    overflow: visible !important;
+html, body, .stApp {
+    margin:0 !important;
+    width:100vw !important;
+    min-height:100vh !important;
+    overflow:hidden !important;
+}
+.stApp {
+    background:#777 !important;
+    color:#111 !important;
+}
+.stApp .block-container {
+    width:1180px !important;
+    max-width:1180px !important;
+    height:760px !important;
+    max-height:760px !important;
+    margin:0 auto !important;
+    padding:48px 58px 42px !important;
+    overflow:hidden !important;
+    border-radius:28px !important;
+    background:linear-gradient(135deg, #fbfbfb 0%, #faf9f7 58%, #fff3ef 100%) !important;
 }
 header, [data-testid="stToolbar"], [data-testid="stDecoration"], #MainMenu, footer { display:none !important; }
-div[data-testid="stVerticalBlock"] { gap: 0.24rem !important; }
-div[data-testid="stHorizontalBlock"] { gap: 1.25rem !important; }
-.music-back {
-    width:30px; height:30px; border-radius:50%; background:#f1f1f1;
-    display:flex; align-items:center; justify-content:center;
-    color:#0b67b2; font-size:23px; font-weight:900; text-decoration:none;
-    margin: 0 0 12px 0;
-}
-.music-logo-row {
-    height:38px;
+div[data-testid="stVerticalBlock"] { gap:0.45rem !important; }
+.write-stable-status {
     display:flex;
-    align-items:flex-start;
-    justify-content:center;
-    margin:0 0 12px 0;
-}
-.music-photo-box {
-    width:100%; height:188px; background:#ffffff; overflow:hidden;
-    display:flex; align-items:center; justify-content:center; color:#6a8396; font-size:24px;
-}
-.music-photo-box img { width:100%; height:100%; object-fit:contain; display:block; background:#ffffff; }
-.music-turntable {
-    height:230px; margin-top:14px; background:#e8e8e8; position:relative; overflow:hidden;
-    display:flex; align-items:center; justify-content:center;
-}
-.music-record {
-    width:178px; height:178px; border-radius:50%; position:relative;
-    background: radial-gradient(circle, #151519 0 48%, #060607 73%, #151515 100%);
-    box-shadow: inset -10px -14px 24px rgba(255,255,255,.04), inset 10px 10px 20px rgba(0,0,0,.28);
-}
-.music-record::after {
-    content:""; position:absolute; left:50%; top:50%; width:56px; height:56px;
-    margin:-28px; border-radius:50%; background:#f35f27; border:3px solid #111;
-}
-.music-caption {
-    color:#747474; font-size:14px; margin: 16px 0 18px; line-height:1.25;
-}
-.music-row-title {
-    font-size:14px; font-weight:900; line-height:1.18;
-    white-space:nowrap; overflow:hidden; text-overflow:ellipsis; padding-top:6px;
-}
-.music-row-title.selected { color:#ef5a28; }
-.music-row-artist {
-    font-size:11px; color:#777; margin-top:5px; line-height:1.1;
-    white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
-}
-.music-cover-empty { width:42px; height:42px; background:#eef3f7; border-radius:6px; }
-.music-line { height:1px; background:#eeeeee; margin: 8px 0 10px; }
-.music-selected {
-    margin: 12px 0 12px;
-    padding: 10px 13px;
-    border-radius:13px;
-    background:rgba(239,90,40,.10);
-    border-left:4px solid #ef5a28;
+    align-items:center;
+    gap:8px;
+    margin:2px 0 26px;
     font-size:13px;
     font-weight:900;
+}
+.write-stable-dot { width:8px; height:8px; border-radius:999px; background:#ef5a28; display:inline-block; }
+.write-stable-photo {
+    width:430px;
+    height:240px;
+    overflow:hidden;
+    background:#eee;
+    margin-bottom:22px;
+}
+.write-stable-photo img { width:100%; height:100%; object-fit:cover; display:block; }
+.write-stable-progress {
+    width:430px;
+    height:5px;
+    background:#d9d9d9;
+    border-radius:999px;
+    overflow:hidden;
+    margin-bottom:28px;
+}
+.write-stable-progress span { height:100%; display:block; background:#ff6b21; }
+.write-stable-question {
+    width:430px;
+    font-size:30px;
+    font-weight:1000;
+    line-height:1.22;
+    word-break:keep-all;
+    margin-bottom:22px;
+}
+.write-stable-sub {
+    width:430px;
+    text-align:center;
+    font-size:15px;
+    font-weight:800;
+    margin-bottom:120px;
+}
+.write-mode-card,
+.write-voice-card {
+    width:100%;
+    height:460px;
+    border-radius:12px;
+    background:#fff;
+    box-shadow:0 8px 18px rgba(0,0,0,.035);
+    padding:38px;
+}
+.write-voice-card {
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+    justify-content:center;
+    text-align:center;
+}
+.write-voice-icon { font-size:46px; margin-bottom:14px; }
+.write-voice-title { font-size:24px; font-weight:1000; margin-bottom:8px; }
+.write-voice-sub { font-size:15px; font-weight:800; color:#777; margin-bottom:24px; }
+.stButton button {
+    cursor:pointer !important;
+}
+.st-key-write_mode_voice_btn button,
+.st-key-write_mode_handwriting_btn button,
+.st-key-write_mode_text_btn button,
+.st-key-write_more_btn button {
+    height:42px !important;
+    min-height:42px !important;
+    border-radius:999px !important;
+    border:0 !important;
+    background:#fff !important;
+    color:#111 !important;
+    box-shadow:0 8px 18px rgba(0,0,0,.10) !important;
+    font-size:14px !important;
+    font-weight:900 !important;
+    white-space:nowrap !important;
+}
+.st-key-write_prev_btn button,
+.st-key-write_next_btn button,
+.st-key-write_done_btn button {
+    height:54px !important;
+    min-height:54px !important;
+    border:0 !important;
+    border-radius:9px !important;
+    background:#fff !important;
+    color:#111 !important;
+    box-shadow:0 9px 18px rgba(0,0,0,.09) !important;
+    font-size:18px !important;
+    font-weight:1000 !important;
+}
+.st-key-write_done_btn button {
+    background:#111 !important;
+    color:#fff !important;
+}
+.write-toolbar-shell { display:none !important; }
+.st-key-write_tool_pen_btn button,
+.st-key-write_tool_eraser_btn button,
+.st-key-write_undo_btn button,
+.st-key-write_redo_btn button {
+    height:34px !important;
+    min-height:34px !important;
+    border-radius:999px !important;
+    border:0 !important;
+    background:transparent !important;
+    color:#111 !important;
+    box-shadow:none !important;
+    font-size:19px !important;
+    font-weight:900 !important;
+    padding:0 !important;
+}
+.st-key-write_tool_pen_btn button:hover,
+.st-key-write_tool_eraser_btn button:hover,
+.st-key-write_undo_btn button:hover,
+.st-key-write_redo_btn button:hover {
+    background:rgba(0,0,0,.04) !important;
+}
+.st-key-write_color_black_btn,
+.st-key-write_color_blue_btn,
+.st-key-write_color_green_btn,
+.st-key-write_color_yellow_btn,
+.st-key-write_color_red_btn {
+    height:38px !important;
+    min-height:38px !important;
+    display:flex !important;
+    align-items:center !important;
+    justify-content:center !important;
+}
+.st-key-write_color_black_btn button,
+.st-key-write_color_blue_btn button,
+.st-key-write_color_green_btn button,
+.st-key-write_color_yellow_btn button,
+.st-key-write_color_red_btn button {
+    width:24px !important;
+    min-width:24px !important;
+    max-width:24px !important;
+    height:24px !important;
+    min-height:24px !important;
+    max-height:24px !important;
+    border-radius:999px !important;
+    border:0 !important;
+    padding:0 !important;
+    margin:0 auto !important;
+    transform:translateY(-2px) !important;
+    box-shadow:none !important;
+    overflow:hidden !important;
+}
+.st-key-write_color_black_btn button *,
+.st-key-write_color_blue_btn button *,
+.st-key-write_color_green_btn button *,
+.st-key-write_color_yellow_btn button *,
+.st-key-write_color_red_btn button * {
+    display:none !important;
+    font-size:0 !important;
+    line-height:0 !important;
+    color:transparent !important;
+}
+.st-key-write_color_black_btn button { background:#000000 !important; }
+.st-key-write_color_blue_btn button { background:#1e88e5 !important; }
+.st-key-write_color_green_btn button { background:#44c767 !important; }
+.st-key-write_color_yellow_btn button { background:#f8c51b !important; }
+.st-key-write_color_red_btn button { background:#ff4a3d !important; }
+.st-key-write_color_black_btn button:hover,
+.st-key-write_color_blue_btn button:hover,
+.st-key-write_color_green_btn button:hover,
+.st-key-write_color_yellow_btn button:hover,
+.st-key-write_color_red_btn button:hover {
+    filter:brightness(.96);
+}
+.st-key-write_width_slider div[data-testid="stSlider"] { padding-top:0 !important; margin-top:-4px !important; }
+.st-key-question_answer_0 textarea,
+.st-key-question_answer_1 textarea,
+.st-key-question_answer_2 textarea {
+    height:460px !important;
+    min-height:460px !important;
+    resize:none !important;
+    border-radius:12px !important;
+    background:#fff !important;
+    box-shadow:0 8px 18px rgba(0,0,0,.035) !important;
+    font-size:20px !important;
+    line-height:1.55 !important;
+    padding:32px !important;
+}
+.st-key-question_answer_0 label,
+.st-key-question_answer_1 label,
+.st-key-question_answer_2 label { display:none !important; }
+iframe[title*="streamlit_drawable_canvas"] {
+    border:0 !important;
+    outline:0 !important;
+    border-radius:12px !important;
+    background:#fff !important;
+    box-shadow:0 8px 18px rgba(0,0,0,.035) !important;
+    display:block !important;
+}
+div[data-testid="stIFrame"] {
+    border:0 !important;
+    outline:0 !important;
+    background:transparent !important;
+    box-shadow:none !important;
+    overflow:visible !important;
+    margin-top:8px !important;
+}
+</style>
+""")
+    selected_selector_map = {
+        "#000000": ".st-key-write_color_black_btn button",
+        "#1e88e5": ".st-key-write_color_blue_btn button",
+        "#44c767": ".st-key-write_color_green_btn button",
+        "#f8c51b": ".st-key-write_color_yellow_btn button",
+        "#ff4a3d": ".st-key-write_color_red_btn button",
+    }
+    selected_selector = selected_selector_map.get(str(pen_color).lower())
+    if selected_selector:
+        html(f"""
+<style>
+{selected_selector} {{
+    box-shadow:0 0 0 3px #2f80ed, 0 0 0 7px #ffffff !important;
+    transform:translateY(-1px) scale(1.02) !important;
+}}
+</style>
+""")
+
+    left_col, right_col = st.columns([0.43, 0.57], gap="large")
+
+    with left_col:
+        src = image_src(photo_path)
+        photo_html = f'<img src="{escape(src, quote=True)}" alt="">' if src else ""
+        html(f"""
+<div class="write-stable-status"><span class="write-stable-dot"></span>기록 중</div>
+<div class="write-stable-photo">{photo_html}</div>
+<div class="write-stable-progress"><span style="width:{progress_width}%"></span></div>
+<div class="write-stable-question">Q{idx + 1}. {escape(question)}</div>
+<div class="write-stable-sub">특별한 날이었을까요?</div>
+""")
+        nav_col1, nav_col2 = st.columns(2, gap="small")
+        with nav_col1:
+            if st.button("이전", key="write_prev_btn", use_container_width=True):
+                move_write_question(max(0, idx - 1))
+                st.rerun()
+        with nav_col2:
+            if is_last_question:
+                if st.button("작성 완료", key="write_done_btn", use_container_width=True):
+                    finish_write_record(canvas_key)
+                    st.rerun()
+            else:
+                if st.button("다음", key="write_next_btn", use_container_width=True):
+                    move_write_question(min(len(questions) - 1, idx + 1))
+                    st.rerun()
+
+    with right_col:
+        mode_cols = st.columns([1, 1, 1, 0.25], gap="small")
+        with mode_cols[0]:
+            if st.button("● 음성 기록", key="write_mode_voice_btn", use_container_width=True):
+                save_current_question_answer()
+                st.session_state.write_mode = "voice"
+                st.rerun()
+        with mode_cols[1]:
+            if st.button("✎ 손글씨", key="write_mode_handwriting_btn", use_container_width=True):
+                save_current_question_answer()
+                st.session_state.write_mode = "handwriting"
+                st.rerun()
+        with mode_cols[2]:
+            if st.button("T 텍스트 변환", key="write_mode_text_btn", use_container_width=True):
+                save_current_question_answer()
+                st.session_state.write_mode = "text"
+                st.rerun()
+        with mode_cols[3]:
+            if st.button("⋮", key="write_more_btn", use_container_width=True):
+                st.session_state.write_more_open = not st.session_state.get("write_more_open", False)
+                st.rerun()
+
+        if mode == "handwriting":
+            tool_cols = st.columns([0.45, 0.45, 0.45, 0.45, 0.38, 0.38, 0.38, 0.38, 0.38, 1.8, 0.3], gap="small")
+            with tool_cols[0]:
+                if st.button("✎", key="write_tool_pen_btn"):
+                    set_drawing_tool("pen")
+            with tool_cols[1]:
+                if st.button("▱", key="write_tool_eraser_btn"):
+                    set_drawing_tool("eraser")
+            with tool_cols[2]:
+                if st.button("↶", key="write_undo_btn"):
+                    undo_handwriting(canvas_key)
+                    st.rerun()
+            with tool_cols[3]:
+                if st.button("↷", key="write_redo_btn"):
+                    redo_handwriting()
+                    st.rerun()
+
+            color_buttons = [
+                ("write_color_black_btn", "#000000"),
+                ("write_color_blue_btn", "#1e88e5"),
+                ("write_color_green_btn", "#44c767"),
+                ("write_color_yellow_btn", "#f8c51b"),
+                ("write_color_red_btn", "#ff4a3d"),
+            ]
+            for col, (button_key, color_value) in zip(tool_cols[4:9], color_buttons):
+                with col:
+                    if st.button(" ", key=button_key):
+                        set_pen_color(color_value)
+
+            with tool_cols[9]:
+                new_width = st.slider(
+                    "굵기",
+                    min_value=1,
+                    max_value=7,
+                    value=pen_width,
+                    key="write_width_slider",
+                    label_visibility="collapsed",
+                )
+                if int(new_width) != pen_width:
+                    st.session_state.pen_width = int(new_width)
+                    st.session_state.stroke_width = int(new_width)
+            with tool_cols[10]:
+                st.markdown(f"<div style='height:36px;display:flex;align-items:center;font-size:12px;font-weight:900;color:#777'>{st.session_state.get('pen_width', pen_width)}</div>", unsafe_allow_html=True)
+
+            active_pen_color = st.session_state.get("pen_color", "#000000")
+            active_pen_width = int(st.session_state.get("stroke_width", st.session_state.get("pen_width", 3)) or 3)
+            active_drawing_tool = st.session_state.get("drawing_tool", "pen")
+            active_stroke_color = "#ffffff" if active_drawing_tool == "eraser" else active_pen_color
+            active_stroke_width = max(active_pen_width * 4, 18) if active_drawing_tool == "eraser" else active_pen_width
+            selected_selector = selected_selector_map.get(str(active_pen_color).lower())
+            if selected_selector:
+                html(f"""
+<style>
+{selected_selector} {{
+    box-shadow:0 0 0 3px #2f80ed, 0 0 0 7px #ffffff !important;
+    transform:translateY(-1px) scale(1.02) !important;
+}}
+</style>
+""")
+
+            canvas_initial = (
+                st.session_state.get("handwriting_json")
+                if st.session_state.get("force_canvas_redraw")
+                else None
+            )
+            canvas_result = st_canvas(
+                fill_color="rgba(255,255,255,0)",
+                stroke_width=active_stroke_width,
+                stroke_color=active_stroke_color,
+                background_color="#ffffff",
+                height=460,
+                width=620,
+                drawing_mode="freedraw",
+                initial_drawing=canvas_initial,
+                update_streamlit=False,
+                display_toolbar=False,
+                key=canvas_key,
+            )
+            if canvas_result is not None and canvas_result.json_data:
+                st.session_state.handwriting_json = canvas_result.json_data
+            if canvas_result is not None and canvas_result.image_data is not None:
+                st.session_state.handwriting_image_data = canvas_result.image_data
+            st.session_state.force_canvas_redraw = False
+
+        elif mode == "voice":
+            html("""
+<div class="write-voice-card">
+  <div class="write-voice-icon">🎙</div>
+  <div class="write-voice-title">음성 기록</div>
+  <div class="write-voice-sub">추억을 말로 들려주세요</div>
+</div>
+""")
+            if hasattr(st, "audio_input"):
+                voice_file = st.audio_input("음성 기록", key=f"write_voice_audio_{idx}")
+            else:
+                voice_file = st.file_uploader("음성 파일 업로드", type=["wav", "mp3", "m4a", "webm"], key=f"write_voice_upload_{idx}")
+            if voice_file is not None:
+                if st.button("텍스트로 변환하기", key=f"write_voice_transcribe_{idx}"):
+                    text = transcribe_audio(voice_file)
+                    if text:
+                        st.session_state[answer_key] = text
+                        answers[str(idx)] = text
+                        st.session_state.question_answers = answers
+                        sync_answer_to_memory_text()
+                    else:
+                        st.warning("음성을 텍스트로 변환하지 못했어요.")
+                    st.rerun()
+            if st.session_state.get(answer_key):
+                st.info(st.session_state.get(answer_key))
+
+        else:
+            text_value = st.text_area(
+                "질문 답변",
+                key=answer_key,
+                label_visibility="collapsed",
+                placeholder="이 질문에 대한 기억을 적어주세요.",
+                height=460,
+            )
+            answers[str(idx)] = str(text_value or "").strip()
+            st.session_state.question_answers = answers
+            sync_answer_to_memory_text()
+
+
+elif page == "memory_done":
+    memory = st.session_state.get("play_memory") or active_memory()
+    if not memory or not media_reference_available(memory.get("photo") or st.session_state.get("photo_path")):
+        go("home")
+    photo_src = image_src(photo_path_for_memory(memory) or st.session_state.get("photo_path"))
+    photo_html = f'<img src="{escape(photo_src, quote=True)}">' if photo_src else ""
+    title = escape(memory_title(memory))
+    preview = escape(memory_note_preview(memory, 42))
+    html(f"""
+<style>
+.stApp {{ background:#777 !important; }}
+.block-container {{
+    max-width:1180px !important;
+    min-height:760px !important;
+    padding:66px 56px 82px !important;
+    background:
+      radial-gradient(circle at 18% 62%, rgba(255,105,33,.11), transparent 34%),
+      radial-gradient(circle at 92% 100%, rgba(255,105,33,.10), transparent 38%),
+      #fbfbfb !important;
+    overflow-y:auto !important;
+}}
+header, [data-testid="stToolbar"], [data-testid="stDecoration"], #MainMenu, footer {{ display:none !important; }}
+div[data-testid="stVerticalBlock"] {{ gap:0 !important; }}
+.memory-done-title {{
+    text-align:center;
+    color:#111;
+    font-size:22px;
+    font-weight:1000;
+    margin:0 0 28px;
+}}
+.memory-done-card {{
+    width:420px;
+    max-width:72%;
+    margin:0 auto 48px;
+    padding:14px 14px 32px;
+    border-radius:14px;
+    background:#fff;
+    box-shadow:0 14px 34px rgba(0,0,0,.07);
+}}
+.memory-done-photo {{
+    height:230px;
+    border-radius:9px;
+    overflow:hidden;
+    background:#eee;
+    margin-bottom:14px;
+}}
+.memory-done-photo img {{
+    width:100%;
+    height:100%;
+    object-fit:cover;
+    display:block;
+}}
+.memory-done-card-title {{
+    color:#111;
+    font-size:16px;
+    line-height:1.25;
+    font-weight:1000;
+    margin:0 8px 18px;
+}}
+.memory-done-preview {{
+    color:#8c837d;
+    font-size:12px;
+    line-height:1.5;
+    font-weight:800;
+    margin:0 8px;
     white-space:nowrap;
     overflow:hidden;
     text-overflow:ellipsis;
-    display:block;
-}
-.music-hint { margin-top:12px; color:#777; font-size:13px; }
-/* 검색창/버튼 */
-div[data-testid="stTextInput"] { margin-bottom: 0 !important; }
-div[data-testid="stTextInput"] input {
-    height:46px !important; min-height:46px !important;
-    border:0 !important; border-radius:8px !important; background:#f5f5f5 !important;
-    padding-left:18px !important; font-size:17px !important; box-shadow:none !important;
-}
-.stButton > button {
-    height:46px !important; min-height:46px !important; padding:0 12px !important;
-    border-radius:999px !important; border:0 !important;
-    background:#fff !important; color:#111 !important;
-    box-shadow:0 8px 18px rgba(0,0,0,.09) !important;
-    font-size:16px !important; font-weight:900 !important;
-}
-.stButton > button:hover, .stButton > button:focus { border:0 !important; background:#fff !important; color:#111 !important; }
-.track-plus { width:48px; margin-left:auto; }
-.track-plus .stButton > button {
-    width:48px !important;
-    height:48px !important;
-    min-height:48px !important;
-    padding:0 !important;
-    border-radius:999px !important;
-    font-size:21px !important;
-    line-height:1 !important;
-}
-div[data-testid="stAudio"] { margin: 6px 0 10px !important; }
-/* 앨범 커버 */
-[data-testid="stImage"] img { border-radius:5px !important; object-fit:cover !important; }
-/* 작은 화면에서도 카드 안에서 유지 */
-@media (max-width: 820px) {
-    .block-container { max-width: 760px !important; min-height: 520px !important; padding: 16px 24px 22px !important; }
-    div[data-testid="stHorizontalBlock"] { gap: .85rem !important; }
-    .music-photo-box { height:142px; }
-    .music-turntable { height:176px; }
-    .music-record { width:138px; height:138px; }
-    .music-row-title { font-size:12px; }
-    .music-row-artist { font-size:10px; }
-    div[data-testid="stTextInput"] input, .stButton > button { height:38px !important; min-height:38px !important; font-size:13px !important; }
-}
-</style>
-""", unsafe_allow_html=True)
-
-    st.markdown(f'<div class="music-logo-row">{FLOW_LOGO_HTML}</div>', unsafe_allow_html=True)
-
-    left_col, right_col = st.columns([0.45, 0.55], gap="large")
-
-    with left_col:
-        if st.session_state.photo_path and os.path.exists(st.session_state.photo_path):
-            src = image_src(st.session_state.photo_path)
-            st.markdown(f'<div class="music-photo-box"><img src="{src}"></div>', unsafe_allow_html=True)
-        else:
-            st.markdown('<div class="music-photo-box">▧</div>', unsafe_allow_html=True)
-        st.markdown('<div class="music-turntable"><div class="music-record"></div></div>', unsafe_allow_html=True)
-
-    with right_col:
-        search_cols = st.columns([0.76, 0.24], gap="small")
-        with search_cols[0]:
-            query = st.text_input(
-                "노래 검색",
-                value=st.session_state.spotify_query,
-                placeholder="검색",
-                label_visibility="collapsed",
-                key="music_search_input_tight_card",
-            )
-        with search_cols[1]:
-            search_clicked = st.button("검색", key="music_search_button_tight_card", use_container_width=True)
-
-        if search_clicked:
-            st.session_state.spotify_query = query.strip()
-            search_term = st.session_state.spotify_query or "korean old pop memories"
-            st.session_state.spotify_tracks = spotify_recommendations(search_term)
-            st.session_state.selected_track = None
-            st.session_state.music_show_more = False
-            st.rerun()
-
-        caption = (
-            f'검색 결과: <b>{escape(st.session_state.spotify_query)}</b>'
-            if st.session_state.spotify_query
-            else 'AI가 사진 분위기에 맞춰 추천한 노래예요.'
-        )
-        st.markdown(f'<div class="music-caption">{caption}</div>', unsafe_allow_html=True)
-
-        tracks = st.session_state.spotify_tracks or []
-        # 카드 안에서 안 겹치도록 4개만 표시
-        display_count = len(tracks) if st.session_state.music_show_more else 4
-        visible_tracks = tracks[:display_count]
-        for index, track in enumerate(visible_tracks):
-            title = track.get("title", "")
-            artist = track.get("artist", "")
-            cover_url = track.get("image", "")
-            selected = (
-                st.session_state.selected_track
-                and st.session_state.selected_track.get("title") == title
-                and st.session_state.selected_track.get("artist") == artist
-            )
-
-            row_cols = st.columns([0.13, 0.72, 0.15], gap="small")
-            with row_cols[0]:
-                if cover_url:
-                    st.image(cover_url, width=42)
-                else:
-                    st.markdown('<div class="music-cover-empty"></div>', unsafe_allow_html=True)
-            with row_cols[1]:
-                selected_cls = " selected" if selected else ""
-                st.markdown(
-                    f'<div class="music-row-title{selected_cls}">{escape(title)}</div>'
-                    f'<div class="music-row-artist">{escape(artist)}</div>',
-                    unsafe_allow_html=True,
-                )
-            with row_cols[2]:
-                st.markdown('<div class="track-plus">', unsafe_allow_html=True)
-                if st.button("✓" if selected else "+", key=f"choose_track_tight_card_{index}", use_container_width=True):
-                    st.session_state.selected_track = track
-                    st.rerun()
-                st.markdown('</div>', unsafe_allow_html=True)
-            st.markdown('<div class="music-line"></div>', unsafe_allow_html=True)
-
-        if len(tracks) > 4:
-            more_label = "접기" if st.session_state.music_show_more else "더 많은 음악 보기"
-            if st.button(more_label, key="toggle_more_music", use_container_width=True):
-                st.session_state.music_show_more = not st.session_state.music_show_more
-                st.rerun()
-
-        selected_track = st.session_state.selected_track
-        if selected_track:
-            st.markdown(
-                f'<div class="music-selected">선택된 노래: '
-                f'{escape(selected_track.get("title", ""))} - {escape(selected_track.get("artist", ""))}</div>',
-                unsafe_allow_html=True,
-            )
-            preview_url = selected_track.get("preview_url")
-            if preview_url:
-                st.audio(preview_url, format="audio/mp3")
-            else:
-                st.markdown('<div class="music-hint">이 곡은 Spotify 미리듣기를 제공하지 않아요.</div>', unsafe_allow_html=True)
-            st.markdown('<div style="height:10px"></div>', unsafe_allow_html=True)
-            if st.button("이 노래로 저장하기", key="save_selected_music_tight_card", use_container_width=True):
-                edit_memory_id = st.session_state.get("editing_memory_id")
-                if edit_memory_id and st.session_state.get("edit_mode") == "music_edit":
-                    if update_memory_track(edit_memory_id, selected_track):
-                        finish_existing_music_edit()
-                        st.rerun()
-                    st.warning("음악을 저장할 기존 기록을 찾지 못했어요.")
-                else:
-                    save_memory(include_summary=False)
-                    go("category_loading")
-        else:
-            st.markdown('<div class="music-hint">노래 오른쪽 +를 누르면 저장할 노래로 선택돼요.</div>', unsafe_allow_html=True)
-
-elif page == "category_loading":
-    if is_existing_edit_flow():
-        finish_existing_music_edit()
-        st.rerun()
-    st.markdown("""
-<style>
-.stApp, html, body { background:#efefef !important; overflow:hidden !important; }
-.block-container { max-width:none !important; width:100vw !important; height:100vh !important; min-height:100vh !important; margin:0 !important; padding:0 !important; background:#efefef !important; overflow:hidden !important; }
-header, [data-testid="stToolbar"], [data-testid="stDecoration"], #MainMenu, footer { display:none !important; }
-.category-loading-overlay { position:fixed; inset:0; z-index:999999; background:#efefef; display:flex; justify-content:center; align-items:flex-start; padding-top:18px; overflow:hidden; }
-.category-loading { width:760px; max-width:calc(100vw - 32px); height:calc(100vh - 36px); min-height:430px; position:relative; display:flex; flex-direction:column; align-items:center; justify-content:center; text-align:center; background:#fff; overflow:hidden; }
-.category-loading::after { content:""; position:absolute; width:210px; height:210px; left:50%; bottom:-70px; transform:translateX(-50%); border-radius:50%; background:radial-gradient(circle, rgba(255,104,32,.85), rgba(255,104,32,.25) 32%, rgba(255,104,32,0) 72%); filter:blur(3px); }
-.ai-chip { height:28px; padding:0 18px; border-radius:999px; background:#fff; box-shadow:0 8px 18px rgba(0,0,0,.08); display:flex; align-items:center; justify-content:center; font-size:11px; font-weight:900; margin-bottom:24px; position:relative; z-index:2; }
-.category-loading h2 { margin:0; font-size:18px; line-height:1.55; position:relative; z-index:2; }
-</style>
-""", unsafe_allow_html=True)
-    html("""
-<div class="category-loading-overlay">
-  <div class="category-loading">
-    <div class="ai-chip">AI 생성</div>
-    <h2>AI가 당신의 추억을 분석해<br>카테고리를 추천했어요</h2>
-  </div>
-</div>
-""")
-    time.sleep(2.4)
-    go("category_edit")
-
-elif page == "category_edit":
-    if is_existing_edit_flow():
-        finish_existing_music_edit()
-        st.rerun()
-    options = category_candidates()
-    selected_categories = ensure_selected_categories()
-    if "category_direct_text" not in st.session_state:
-        st.session_state.category_direct_text = ""
-    chip_classes = ["c1", "c2", "c3", "c4", "c5"]
-    selected_categories = ensure_selected_categories()
-    selected_tag_html = "".join(
-        f'<span class="direct-tag">#{escape(category)}</span>'
-        for category in selected_categories
-    )
-    chip_button_css = ""
-    for index, option in enumerate(options):
-        selected = option in selected_categories
-        cls = chip_classes[index]
-        chip_button_css += f"""
-.st-key-category_chip_{index} {{
-    position:absolute !important;
-    z-index:5 !important;
 }}
-.st-key-category_chip_{index} button {{
-    min-width:112px !important;
-    height:30px !important;
-    padding:0 20px !important;
+.memory-done-actions {{
+    width:min(620px, 72%);
+    margin:0 auto;
+}}
+.memory-done-actions div[data-testid="stHorizontalBlock"] {{
+    gap:72px !important;
+}}
+.st-key-memory_done_skip button,
+.st-key-memory_done_add_music button {{
+    width:100% !important;
+    height:62px !important;
+    min-height:62px !important;
+    border-radius:7px !important;
     border:0 !important;
-    border-radius:999px !important;
-    background:{'#ffd0a9' if selected else '#fff'} !important;
-    color:#111 !important;
-    box-shadow:0 9px 20px {'rgba(255,104,32,.22)' if selected else 'rgba(0,0,0,.10)'} !important;
-    font-size:12px !important;
-    font-weight:900 !important;
+    font-size:15px !important;
+    font-weight:1000 !important;
+    box-shadow:0 10px 22px rgba(0,0,0,.10) !important;
 }}
-"""
-        if cls == "c1":
-            chip_button_css += f".st-key-category_chip_{index} {{ left:260px !important; top:160px !important; }}\n"
-        elif cls == "c2":
-            chip_button_css += f".st-key-category_chip_{index} {{ right:165px !important; top:190px !important; }}\n"
-        elif cls == "c3":
-            chip_button_css += f".st-key-category_chip_{index} {{ left:180px !important; top:238px !important; }}\n"
-        elif cls == "c4":
-            chip_button_css += f".st-key-category_chip_{index} {{ right:185px !important; top:256px !important; }}\n"
-        else:
-            chip_button_css += f".st-key-category_chip_{index} {{ left:310px !important; top:290px !important; }}\n"
-    st.markdown("""
+.st-key-memory_done_skip button {{
+    background:#fff !important;
+    color:#111 !important;
+}}
+.st-key-memory_done_add_music button {{
+    background:#050505 !important;
+    color:#fff !important;
+}}
+@media (max-width:900px) {{
+    .block-container {{ padding:54px 34px 74px !important; }}
+    .memory-done-card {{ max-width:82%; }}
+    .memory-done-actions {{ width:82%; }}
+    .memory-done-actions div[data-testid="stHorizontalBlock"] {{ gap:42px !important; }}
+}}
+@media (max-width:640px) {{
+    .block-container {{ padding:38px 20px 70px !important; }}
+    .memory-done-card {{ width:100%; max-width:100%; }}
+    .memory-done-actions {{ width:100%; }}
+    .memory-done-actions div[data-testid="stHorizontalBlock"] {{ gap:16px !important; }}
+}}
+</style>
+<div class="memory-done-title">추억 생성 완료!</div>
+<div class="memory-done-card">
+  <div class="memory-done-photo">{photo_html}</div>
+  <div class="memory-done-card-title">{title}</div>
+  <div class="memory-done-preview">{preview}</div>
+</div>
+<div class="memory-done-actions">
+""")
+    skip_col, music_col = st.columns(2)
+    with skip_col:
+        if st.button("건너뛰기", key="memory_done_skip", use_container_width=True):
+            st.session_state.page = "home"
+            st.rerun()
+    with music_col:
+        if st.button("음악 추가하기", key="memory_done_add_music", use_container_width=True):
+            st.session_state.page = "music_loading"
+            st.rerun()
+    html("</div>")
+
+elif page == "music_loading":
+    memory = active_memory()
+    if not st.session_state.get("spotify_tracks"):
+        st.session_state.spotify_tracks = spotify_recommendations(photo_music_query(memory))
+
+    html("""
 <style>
-.stApp { background:#efefef !important; }
-.block-container {
-    max-width:760px !important;
-    min-height:540px !important;
-    margin:24px auto 0 !important;
+html, body, .stApp { margin:0 !important; width:100vw !important; height:100vh !important; overflow:hidden !important; }
+.stApp { background:#777 !important; color:#111 !important; }
+.stApp .block-container {
+    width:1180px !important;
+    min-width:1180px !important;
+    max-width:1180px !important;
+    height:760px !important;
+    min-height:760px !important;
+    max-height:760px !important;
+    margin:0 auto !important;
     padding:0 !important;
-    background:radial-gradient(circle at 47% 45%, rgba(255,104,32,.68), rgba(255,104,32,.22) 16%, transparent 32%), #fffaf7 !important;
     overflow:hidden !important;
+    background:
+      radial-gradient(circle at 50% 104%, rgba(255,105,33,.82) 0, rgba(255,105,33,.42) 9%, rgba(255,105,33,.12) 20%, transparent 32%),
+      linear-gradient(135deg, #fbfbfb 0%, #faf9f7 58%, #fff3ef 100%) !important;
     position:relative !important;
 }
 header, [data-testid="stToolbar"], [data-testid="stDecoration"], #MainMenu, footer { display:none !important; }
-.category-edit-shell { position:relative; height:540px; padding:32px 54px 34px; }
-.post-handle { width:24px; height:3px; border-radius:999px; background:#cfc7c2; margin:0 auto 54px; }
-.category-title { text-align:center; font-size:20px; font-weight:900; margin-bottom:18px; }
-.category-orb { position:absolute; left:50%; top:180px; width:170px; height:170px; transform:translateX(-50%); border-radius:50%; background:radial-gradient(circle, rgba(255,104,32,.82), rgba(255,104,32,.24) 42%, rgba(255,104,32,0) 72%); filter:blur(2px); }
-.direct-category-card { position:absolute; left:54px; right:54px; bottom:100px; min-height:92px; border-radius:9px; background:#fff; box-shadow:0 9px 18px rgba(0,0,0,.12); padding:16px 18px; font-size:11px; }
-.direct-title { font-size:12px; font-weight:900; margin-bottom:6px; }
-.direct-tag-row { display:flex; gap:10px; flex-wrap:wrap; margin-top:12px; min-height:28px; max-width:360px; }
-.direct-tag { height:28px; min-width:92px; padding:0 18px; border-radius:999px; background:#fff; box-shadow:0 8px 16px rgba(0,0,0,.08); display:flex; align-items:center; justify-content:center; font-size:11px; font-weight:900; }
-.category-input-wrap { display:contents !important; }
-.st-key-category_direct_input {
-    position:absolute !important;
-    left:410px !important;
-    top:382px !important;
-    width:250px !important;
-    max-width:250px !important;
-    height:32px !important;
-    z-index:7 !important;
+div[data-testid="stVerticalBlock"] { gap:0 !important; }
+.music-loading-page {
+    width:1180px;
+    height:760px;
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+    justify-content:center;
+    text-align:center;
+    padding-bottom:130px;
 }
-.st-key-category_direct_input > div,
-.st-key-category_direct_input div[data-testid="stTextInput"],
-.st-key-category_direct_input div[data-testid="stTextInput"] > div,
-.st-key-category_direct_input div[data-testid="stTextInputRootElement"],
-.st-key-category_direct_input div[data-testid="stTextInput"],
-.st-key-category_direct_input div[data-baseweb="input"] {
-    width:100% !important;
-    max-width:100% !important;
-    height:32px !important;
-    min-height:32px !important;
+.music-loading-pill {
+    height:28px;
+    padding:0 22px;
+    border-radius:999px;
+    background:#f3f3f3;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    color:#111;
+    font-size:12px;
+    font-weight:900;
+    margin-bottom:74px;
+}
+.music-loading-title {
+    font-size:28px;
+    line-height:1.58;
+    font-weight:500;
+    letter-spacing:0;
+}
+.music-loading-title b { font-weight:1000; }
+</style>
+<div class="music-loading-page">
+  <div class="music-loading-pill">AI 추천</div>
+  <div class="music-loading-title">AI가 <b>당신의 추억</b>을 분석해<br>노래를 추천중이에요.</div>
+</div>
+""")
+    time.sleep(1.6)
+    st.session_state.page = "music"
+    st.rerun()
+
+elif page == "music":
+    memory = active_memory()
+    if not st.session_state.get("photo_path") and st.session_state.get("memory_id"):
+        restore_photo(st.session_state.memory_id)
+
+    if not st.session_state.get("spotify_tracks"):
+        st.session_state.spotify_tracks = spotify_recommendations(photo_music_query(memory))
+
+    def make_track_lyrics(track):
+        """Show real lyrics attached to the track. Do not generate fake lyrics."""
+        track = normalize_track(track)
+        existing = track.get("lyrics")
+        if isinstance(existing, list):
+            clean_lines = [str(line).strip() for line in existing if str(line).strip()]
+            if clean_lines and clean_lines != DEFAULT_TRACK_LYRICS:
+                return clean_lines[:10]
+        if isinstance(existing, str) and existing.strip():
+            return [line.strip() for line in existing.splitlines() if line.strip()][:10]
+        return [
+            "가사를 찾지 못했어요.",
+            "LRCLIB에 등록된 가사가 없는 곡일 수 있어요.",
+        ]
+
+    def normalized_music_track(track):
+        track = normalize_track(track)
+        track["lyrics"] = make_track_lyrics(track)
+        return track
+
+    raw_tracks = st.session_state.get("spotify_tracks") or []
+    tracks = [normalized_music_track(track) for track in raw_tracks]
+
+    raw_selected_track = st.session_state.get("selected_track") or memory.get("selected_track") or {}
+    selected_track = normalized_music_track(raw_selected_track) if raw_selected_track else {}
+    if selected_track:
+        st.session_state.selected_track = selected_track
+
+    photo_src = image_src(photo_path_for_memory(memory) or st.session_state.get("photo_path"))
+    photo_html = f'<img src="{escape(photo_src, quote=True)}" alt="memory photo">' if photo_src else '<div class="music-photo-empty">사진 미리보기</div>'
+    screen_title = escape(memory_title(memory))
+
+    def cover_html(track, class_name="music-track-cover"):
+        track = normalized_music_track(track)
+        cover = track.get("image") or ""
+        if cover:
+            return f'<div class="{class_name}"><img src="{escape(cover, quote=True)}" alt=""></div>'
+        return f'<div class="{class_name}">♪</div>'
+
+    def lyrics_markup(track):
+        lines = make_track_lyrics(track)
+        html_lines = []
+        for idx, line in enumerate(lines[:6]):
+            active = " active" if idx == 2 else ""
+            html_lines.append(f'<div class="music-lyric-line{active}">{escape(line)}</div>')
+        return "".join(html_lines)
+
+    html("""
+<style>
+html, body, .stApp {
     margin:0 !important;
-    background:transparent !important;
-    border:0 !important;
-    outline:0 !important;
-    box-shadow:none !important;
-    padding:0 !important;
+    width:100vw !important;
+    height:100vh !important;
+    overflow:hidden !important;
 }
-.st-key-category_direct_input div[data-baseweb="input"] > div,
-.st-key-category_direct_input div[data-baseweb="input"] * {
-    background:transparent !important;
-    border:0 !important;
-    box-shadow:none !important;
+.stApp {
+    background:#777 !important;
+    color:#111 !important;
 }
-.st-key-category_direct_input input {
+.stApp .block-container {
+    width:1180px !important;
+    min-width:1180px !important;
+    max-width:1180px !important;
+    height:760px !important;
+    min-height:760px !important;
+    max-height:760px !important;
+    margin:0 auto !important;
+    padding:34px 44px 26px !important;
+    overflow:hidden !important;
+    background:
+        radial-gradient(circle at 105% 87%, rgba(255,104,35,.36), transparent 31%),
+        radial-gradient(circle at -10% 20%, rgba(255,104,35,.10), transparent 28%),
+        linear-gradient(120deg, #fbfbfb 0%, #faf9f7 54%, #fff2eb 100%) !important;
+    position:relative !important;
+}
+header, [data-testid="stToolbar"], [data-testid="stDecoration"], #MainMenu, footer {
+    display:none !important;
+}
+div[data-testid="stVerticalBlock"] {
+    gap:0 !important;
+}
+div[data-testid="column"] {
+    overflow:visible !important;
+}
+.music-left-title {
+    display:flex;
+    align-items:center;
+    gap:8px;
+    margin:0 0 8px;
+    font-size:22px;
+    line-height:1.05;
+    font-weight:1000;
+    letter-spacing:-.45px;
+}
+.music-left-title span {
+    color:#ff6b21;
+    font-size:22px;
+}
+.music-left-sub {
+    margin:0 0 24px;
+    color:#333;
+    font-size:12px;
+    line-height:1.2;
+    font-weight:800;
+}
+.music-photo-card {
+    width:420px;
+    height:225px;
+    background:#eee;
+    overflow:hidden;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    margin-bottom:34px;
+}
+.music-photo-card img {
+    width:100%;
+    height:100%;
+    object-fit:cover;
+    display:block;
+}
+.music-photo-empty {
+    color:#777;
+    font-size:13px;
+    font-weight:800;
+}
+
+/* 선택 음악 카드: 사용자가 보낸 2번째 참고 이미지처럼 카드 안에 제목/커버/가사/컨트롤을 넣음 */
+.music-player-card {
+    width:420px;
+    height:220px;
+    background:#fff;
+    border-radius:7px;
+    box-shadow:0 12px 26px rgba(0,0,0,.08);
+    overflow:hidden;
+    display:grid;
+    grid-template-rows:38px 116px 5px 61px;
+    margin-bottom:0;
+}
+.music-card-header {
+    height:38px;
+    background:rgba(0,0,0,.025);
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    padding:0 18px;
+}
+.music-card-header b {
+    color:#111;
+    font-size:15px;
+    font-weight:1000;
+    max-width:270px;
+    white-space:nowrap;
+    overflow:hidden;
+    text-overflow:ellipsis;
+}
+.music-card-header span {
+    color:#666;
+    font-size:10px;
+    font-weight:900;
+    max-width:90px;
+    white-space:nowrap;
+    overflow:hidden;
+    text-overflow:ellipsis;
+}
+.music-player-main {
+    display:grid;
+    grid-template-columns:122px 1fr;
+    gap:22px;
+    align-items:center;
+    padding:14px 18px 12px;
+}
+.music-cover-large {
+    width:112px;
+    height:86px;
+    border-radius:3px;
+    background:#111;
+    color:#fff;
+    overflow:hidden;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    font-size:25px;
+}
+.music-cover-large img {
+    width:100%;
+    height:100%;
+    object-fit:cover;
+    display:block;
+}
+.music-player-lyrics {
+    height:92px;
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+    justify-content:center;
+    text-align:center;
+    gap:5px;
+    overflow:hidden;
+}
+.music-lyric-line {
+    color:#9b9b9b;
+    font-size:12px;
+    line-height:1.15;
+    font-weight:800;
+    max-width:220px;
+    white-space:nowrap;
+    overflow:hidden;
+    text-overflow:ellipsis;
+}
+.music-lyric-line.active {
+    color:#111;
+    font-size:14px;
+    font-weight:1000;
+}
+.music-card-progress {
+    height:5px;
+    background:#e2e2e2;
+    overflow:hidden;
+}
+.music-card-progress span {
+    display:block;
+    width:38%;
+    height:100%;
+    background:#ff6b21;
+}
+.music-player-controls {
+    height:61px;
+    display:grid;
+    grid-template-columns:34px 46px 34px 1fr 34px 34px;
+    align-items:center;
+    gap:14px;
+    padding:0 22px;
+    font-size:16px;
+    font-weight:1000;
+}
+.music-play-circle {
+    width:42px;
+    height:42px;
+    border-radius:50%;
+    background:#050505;
+    color:#fff;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    font-size:15px;
+}
+.music-empty-card {
+    width:420px;
+    height:220px;
+    border-radius:7px;
+    background:#fff;
+    box-shadow:0 12px 26px rgba(0,0,0,.08);
+    display:flex;
+    flex-direction:column;
+    justify-content:center;
+    align-items:center;
+    gap:10px;
+}
+.music-empty-card b {
+    font-size:17px;
+    font-weight:1000;
+}
+.music-empty-card span {
+    color:#777;
+    font-size:12px;
+    font-weight:800;
+}
+.music-preview-note {
+    height:0;
+    overflow:hidden;
+}
+div[data-testid="stAudio"] {
+    display:none !important;
+}
+
+.music-right-title {
+    margin:0 0 22px;
+    color:#111;
+    font-size:22px;
+    line-height:1.05;
+    font-weight:1000;
+}
+.st-key-music_search_input input {
     width:100% !important;
-    height:32px !important;
-    min-height:32px !important;
-    border:0 !important;
-    border-radius:0 !important;
-    background:transparent !important;
-    padding:0 !important;
+    height:46px !important;
+    border-radius:6px !important;
+    border:1.5px solid rgba(255,105,33,.62) !important;
+    background:#fff !important;
+    padding:0 18px !important;
     color:#111 !important;
     font-size:12px !important;
-    font-weight:900 !important;
+    font-weight:800 !important;
     box-shadow:none !important;
-    outline:0 !important;
 }
-.st-key-category_direct_input input::placeholder { color:#999 !important; font-weight:700 !important; }
-.category-direct-add { display:contents !important; }
-.st-key-category_direct_add_button { display:none !important; }
-.category-save { position:absolute; left:54px; right:54px; bottom:28px; }
-.category-save button { height:62px !important; border-radius:999px !important; background:#050505 !important; color:#fff !important; border:0 !important; box-shadow:0 12px 24px rgba(0,0,0,.20) !important; font-weight:900 !important; font-size:16px !important; }
-.category-save button::after { content:"추억 기록에 어울리는 음악을 추가해보세요."; display:block; margin-top:5px; font-size:10px; font-weight:500; color:#ddd; }
-""" + chip_button_css + """
+.st-key-music_search_input label {
+    display:none !important;
+}
+.music-list-title {
+    margin:26px 0 14px;
+    color:#111;
+    font-size:17px;
+    line-height:1;
+    font-weight:1000;
+}
+.music-row-spacer {
+    height:63px;
+    display:flex;
+    align-items:center;
+}
+.music-row-line {
+    height:1px;
+    width:440px;
+    margin:-3px 0 0 58px;
+    background:rgba(0,0,0,.075);
+}
+.music-track-cover {
+    width:42px;
+    height:42px;
+    border-radius:2px;
+    background:#d8d8d8;
+    color:#888;
+    overflow:hidden;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    font-size:16px;
+}
+.music-track-cover img {
+    width:100%;
+    height:100%;
+    object-fit:cover;
+    display:block;
+}
+.music-track-title {
+    color:#111;
+    font-size:13px;
+    line-height:1.14;
+    font-weight:1000;
+    max-width:320px;
+    white-space:nowrap;
+    overflow:hidden;
+    text-overflow:ellipsis;
+}
+.music-track-artist {
+    color:#777;
+    font-size:10px;
+    line-height:1.1;
+    margin-top:6px;
+    font-weight:800;
+    white-space:nowrap;
+    overflow:hidden;
+    text-overflow:ellipsis;
+}
+.st-key-music_select_track_0 button,
+.st-key-music_select_track_1 button,
+.st-key-music_select_track_2 button,
+.st-key-music_select_track_3 button,
+.st-key-music_select_track_4 button,
+.st-key-music_select_track_5 button,
+.st-key-music_select_track_6 button,
+.st-key-music_select_track_7 button,
+.st-key-music_select_track_8 button,
+.st-key-music_select_track_9 button {
+    width:30px !important;
+    min-width:30px !important;
+    height:30px !important;
+    min-height:30px !important;
+    border-radius:50% !important;
+    background:transparent !important;
+    color:#ff4b56 !important;
+    border:0 !important;
+    box-shadow:none !important;
+    font-size:18px !important;
+    font-weight:1000 !important;
+    padding:0 !important;
+    margin-top:15px !important;
+}
+.st-key-music_select_track_0 button:hover,
+.st-key-music_select_track_1 button:hover,
+.st-key-music_select_track_2 button:hover,
+.st-key-music_select_track_3 button:hover,
+.st-key-music_select_track_4 button:hover,
+.st-key-music_select_track_5 button:hover,
+.st-key-music_select_track_6 button:hover,
+.st-key-music_select_track_7 button:hover,
+.st-key-music_select_track_8 button:hover,
+.st-key-music_select_track_9 button:hover {
+    background:rgba(255,75,86,.08) !important;
+}
+.st-key-music_more_button button {
+    height:38px !important;
+    min-height:38px !important;
+    background:transparent !important;
+    color:#333 !important;
+    border:0 !important;
+    box-shadow:none !important;
+    font-size:12px !important;
+    font-weight:900 !important;
+    margin-top:12px !important;
+}
+.music-notice {
+    height:18px;
+    color:#ef5a28;
+    font-size:12px;
+    font-weight:900;
+    margin:7px 0 10px;
+}
+.st-key-music_add_done button {
+    height:62px !important;
+    min-height:62px !important;
+    border-radius:7px !important;
+    background:#050505 !important;
+    color:#fff !important;
+    border:0 !important;
+    box-shadow:0 10px 22px rgba(0,0,0,.14) !important;
+    font-size:16px !important;
+    font-weight:1000 !important;
+}
 </style>
-""", unsafe_allow_html=True)
-    html(f"""
-<div class="category-edit-shell">
-  <div class="post-handle"></div>
-  <div class="category-title">AI 추천 카테고리</div>
-  <div class="category-orb"></div>
-  <div class="direct-category-card">
-    <div class="direct-title">직접 추가 및 수정</div>
-    원하는 카테고리를 직접 수정하거나 추가할 수 있어요.
-    <div class="direct-tag-row">{selected_tag_html}</div>
-  </div>
-</div>
-""")
-    for index, option in enumerate(options):
-        selected = option in ensure_selected_categories()
-        label = f"✓ {option}" if selected else option
-        st.button(
-            label,
-            key=f"category_chip_{index}",
-            on_click=toggle_category,
-            args=(option,),
-        )
-    st.markdown('<div class="category-input-wrap">', unsafe_allow_html=True)
-    direct_category = st.text_input(
-        "카테고리 직접 입력",
-        value=st.session_state.category_direct_text,
-        label_visibility="collapsed",
-        key="category_direct_input",
-        placeholder="직접 추가할 카테고리",
-        on_change=add_direct_category,
-    ).strip()
-    st.markdown('</div>', unsafe_allow_html=True)
-    st.markdown('<div class="category-direct-add">', unsafe_allow_html=True)
-    st.button("추가", key="category_direct_add_button", on_click=add_direct_category)
-    st.markdown('</div>', unsafe_allow_html=True)
-    st.markdown('<div class="category-save">', unsafe_allow_html=True)
-    if st.button("선택한 카테고리로 저장하기", key="save_category_button", use_container_width=True):
-        if direct_category:
-            categories = ensure_selected_categories()
-            if direct_category not in categories:
-                categories.append(direct_category)
-            st.session_state.selected_categories = categories
-        sync_selected_category()
-        save_memory()
-        go("album_done")
-    st.markdown('</div>', unsafe_allow_html=True)
-
-elif page == "album_done":
-    if is_existing_edit_flow():
-        finish_existing_music_edit()
-        st.rerun()
-    memory = active_memory()
-    photo_path = active_photo_path(memory)
-    photo_src = image_src(photo_path)
-    photo = f'<img src="{photo_src}">' if photo_src else "▧"
-    track = memory.get("selected_track") or st.session_state.selected_track or {}
-    track_title = escape(track.get("title") or "노래 제목")
-    track_artist = escape(track.get("artist") or "가수")
-    preview_url = track.get("preview_url") or ""
-    if preview_url:
-        song_audio = """
-<div class="custom-player">
-  <audio preload="metadata" src="__PREVIEW_URL__"
-    onloadedmetadata="const p=this.closest('.custom-player');const d=Number.isFinite(this.duration)&&this.duration>0?this.duration:30;p.querySelector('.player-end').textContent='-'+(Math.floor(d/60)+':'+String(Math.floor(d%60)).padStart(2,'0'));"
-    ontimeupdate="const p=this.closest('.custom-player');const d=Number.isFinite(this.duration)&&this.duration>0?this.duration:30;const c=this.currentTime||0;p.querySelector('.player-fill').style.width=Math.max(0,Math.min(100,(c/d)*100))+'%';p.querySelector('.player-now').textContent=Math.floor(c/60)+':'+String(Math.floor(c%60)).padStart(2,'0');const r=Math.max(d-c,0);p.querySelector('.player-end').textContent='-'+(Math.floor(r/60)+':'+String(Math.floor(r%60)).padStart(2,'0'));"
-    onplay="this.closest('.custom-player').querySelector('.player-play').textContent='Ⅱ';"
-    onpause="this.closest('.custom-player').querySelector('.player-play').textContent='▶';"
-    onended="this.closest('.custom-player').querySelector('.player-play').textContent='▶';"></audio>
-  <div class="player-bar" onclick="const p=this.closest('.custom-player');const a=p.querySelector('audio');if(a.duration){const r=this.getBoundingClientRect();a.currentTime=((event.clientX-r.left)/r.width)*a.duration;}">
-    <span class="player-fill"></span>
-  </div>
-  <div class="player-time"><span class="player-now">0:00</span><span class="player-end">-0:30</span></div>
-  <div class="player-controls">
-    <button type="button" onclick="const a=this.closest('.custom-player').querySelector('audio');a.currentTime=0;">⇄</button>
-    <button type="button" onclick="const a=this.closest('.custom-player').querySelector('audio');a.currentTime=Math.max(0,(a.currentTime||0)-10);">◀</button>
-    <button type="button" class="player-play" onclick="const a=this.closest('.custom-player').querySelector('audio');if(a.paused){a.play();this.textContent='Ⅱ';}else{a.pause();this.textContent='▶';}">Ⅱ</button>
-    <button type="button" onclick="const a=this.closest('.custom-player').querySelector('audio');a.currentTime=Math.min(a.duration||30,(a.currentTime||0)+10);">▶</button>
-    <button type="button" onclick="const a=this.closest('.custom-player').querySelector('audio');a.currentTime=0;a.play();">↻</button>
-  </div>
-</div>
-""".replace("__PREVIEW_URL__", escape(preview_url, quote=True))
-    else:
-        song_audio = """
-<div class="custom-player disabled">
-  <div class="player-bar"><span class="player-fill disabled-fill"></span></div>
-  <div class="player-time"><span>0:00</span><span>-0:00</span></div>
-  <div class="player-controls">
-    <button type="button" disabled>⇄</button>
-    <button type="button" disabled>◀</button>
-    <button type="button" class="player-play" disabled>Ⅱ</button>
-    <button type="button" disabled>▶</button>
-    <button type="button" disabled>↻</button>
-  </div>
-</div>
-"""
-    handwriting_src = image_src(active_handwriting_path(memory))
-    handwriting = f'<img src="{handwriting_src}">' if handwriting_src else escape(memory.get("note") or st.session_state.memory_text or "")
-    category_pills = "".join(
-        f'<span class="category-pill">{escape(category)}</span>'
-        for category in ensure_selected_categories()
-    )
-    summary = escape(memory_summary_text(memory))
-    html(f"""
-<style>
-.stApp {{ background:#efefef !important; }}
-.block-container {{ max-width:780px !important; min-height:500px !important; margin:18px auto 0 !important; padding:28px 48px 30px !important; background:#fffaf7 !important; overflow:hidden !important; }}
-header, [data-testid="stToolbar"], [data-testid="stDecoration"], #MainMenu, footer {{ display:none !important; }}
-.post-handle {{ width:24px; height:3px; border-radius:999px; background:#cfc7c2; margin:0 auto 24px; }}
-.album-title {{ font-size:20px; font-weight:900; margin-bottom:8px; }}
-.album-sub {{ font-size:12px; color:#555; margin-bottom:18px; }}
-.album-grid {{ display:grid; grid-template-columns:1.38fr 1.35fr .95fr; gap:12px; }}
-.album-card {{ border-radius:11px; background:#fff; box-shadow:0 9px 20px rgba(0,0,0,.06); padding:14px; min-height:112px; overflow:hidden; }}
-.album-photo img {{ width:100%; height:150px; object-fit:contain; display:block; }}
-.album-card-title {{ font-size:11px; font-weight:900; margin-bottom:10px; }}
-.album-note {{ height:150px; display:flex; align-items:center; justify-content:center; font-size:27px; font-weight:500; color:#333; }}
-.album-note img {{ max-width:100%; max-height:100%; object-fit:contain; }}
-.song-box {{ background:#ffe5d3; min-height:210px; }}
-.song-heart {{ float:right; font-size:18px; }}
-.custom-player {{ margin-top:26px; }}
-.custom-player audio {{ display:none; }}
-.player-bar {{ position:relative; height:3px; border-radius:999px; background:rgba(0,0,0,.20); cursor:pointer; }}
-.player-fill {{ position:absolute; left:0; top:0; bottom:0; width:0%; border-radius:999px; background:#ef7d34; }}
-.disabled-fill {{ width:58%; }}
-.player-time {{ display:flex; justify-content:space-between; margin-top:6px; color:#c0aaa0; font-size:10px; line-height:1; }}
-.player-controls {{ display:flex; align-items:center; justify-content:space-between; margin-top:18px; padding:0 12px; }}
-.player-controls button {{ width:24px; height:24px; display:flex; align-items:center; justify-content:center; border:0; padding:0; margin:0; background:transparent; color:#81756f; font-size:16px; font-weight:900; line-height:1; cursor:pointer; }}
-.player-controls .player-play {{ width:42px; height:42px; border-radius:999px; background:#877b73; color:#fff; font-size:20px; letter-spacing:-2px; box-shadow:0 7px 14px rgba(0,0,0,.12); }}
-.custom-player.disabled {{ opacity:.48; }}
-.custom-player.disabled button,
-.custom-player.disabled .player-bar {{ cursor:default; }}
-.category-box {{ background:#f2fff0; min-height:132px; }}
-.category-pill-row {{ display:flex; gap:12px; margin-top:12px; flex-wrap:wrap; }}
-.category-pill {{ min-width:82px; height:24px; padding:0 14px; border-radius:999px; background:#fff; display:flex; align-items:center; justify-content:center; font-size:10px; font-weight:900; box-shadow:0 6px 14px rgba(0,0,0,.06); }}
-.album-video {{ height:82px; border-radius:7px; background:#dbe7f2; display:flex; align-items:center; justify-content:center; color:#57738b; overflow:hidden; position:relative; }}
-.album-video-link {{ display:block; color:inherit; }}
-.album-video img {{ width:100%; height:100%; object-fit:cover; filter:saturate(.82); }}
-.album-video span {{ position:absolute; width:34px; height:34px; border-radius:50%; background:#fff; display:flex; align-items:center; justify-content:center; box-shadow:0 4px 12px rgba(0,0,0,.18); }}
-.summary-box {{ background:#ffe4eb; font-size:12px; line-height:1.55; min-height:132px; }}
-.st-key-album_edit_button,
-.st-key-album_nfc_button {{ margin-top:16px !important; }}
-.st-key-album_edit_button button,
-.st-key-album_nfc_button button {{ height:58px !important; border-radius:999px !important; border:0 !important; font-size:17px !important; font-weight:900 !important; box-shadow:0 10px 22px rgba(0,0,0,.10) !important; }}
-.st-key-album_edit_button button {{ background:#fff !important; color:#111 !important; }}
-.st-key-album_nfc_button button {{ background:#050505 !important; color:#fff !important; }}
-</style>
-<div class="post-handle"></div>
-<div class="album-title">추억 앨범이 만들어졌어요!</div>
-<div class="album-sub">음악과 기록을 모아 하나의 앨범으로 정리했어요.</div>
-<div class="album-grid">
-  <div class="album-card album-photo">{photo}</div>
-  <div class="album-card album-note"><div style="width:100%;"><div class="album-card-title">손글씨 기록</div>{handwriting}</div></div>
-  <div class="album-card song-box"><div style="color:#ef6b2e; font-size:10px; font-weight:900;">현재 재생 중</div><span class="song-heart">♥</span><b>{track_title}</b><br><span style="color:#777; font-size:11px;">{track_artist}</span>{song_audio}</div>
-  <div class="album-card category-box"><div class="album-card-title">카테고리</div><div class="category-pill-row">{category_pills}</div></div>
-  <div class="album-card"><div class="album-card-title">추억 영상</div><a class="album-video-link" href="?action=video" target="_self"><div class="album-video">{photo}<span>▶</span></div></a></div>
-  <div class="album-card summary-box"><div class="album-card-title">AI 요약</div>{summary}</div>
-</div>
-""")
-    album_left, album_right = st.columns(2)
-    with album_left:
-        if st.button("수정하기", key="album_edit_button", use_container_width=True):
-            go("category_edit")
-    with album_right:
-        if st.button("카세트 앨범 생성", key="album_nfc_button", use_container_width=True):
-            go("nfc_scan")
-
-elif page == "nfc_scan":
-    if is_existing_edit_flow():
-        finish_existing_music_edit()
-        st.rerun()
-    html("""
-<style>
-.stApp { background:#efefef !important; }
-.block-container { max-width:760px !important; min-height:430px !important; margin:24px auto 0 !important; padding:0 !important; background:#fffaf7 !important; overflow:hidden !important; }
-header, [data-testid="stToolbar"], [data-testid="stDecoration"], #MainMenu, footer { display:none !important; }
-.nfc-screen { height:430px; display:flex; flex-direction:column; align-items:center; justify-content:center; text-align:center; background:radial-gradient(circle at 70% 92%, rgba(255,104,32,.22), transparent 34%), #fffaf7; }
-.post-handle { width:24px; height:3px; border-radius:999px; background:#cfc7c2; position:absolute; top:22px; left:50%; transform:translateX(-50%); }
-.nfc-title { font-size:15px; font-weight:900; margin-bottom:28px; }
-.nfc-arrow { color:#ff8b45; font-size:34px; line-height:1; margin-bottom:12px; }
-.nfc-ring { width:150px; height:82px; border-radius:50%; border:1px solid rgba(255,139,69,.25); display:flex; align-items:center; justify-content:center; box-shadow:0 0 0 18px rgba(255,139,69,.04), 0 0 0 38px rgba(255,139,69,.03); background:radial-gradient(circle, rgba(255,139,69,.28), transparent 45%); margin-bottom:24px; }
-.nfc-hit { display:block; color:#111; text-decoration:none; }
-.nfc-label { font-size:20px; font-weight:900; margin-top:12px; }
-.nfc-sub { font-size:10px; color:#777; margin-top:10px; }
-</style>
-<div class="nfc-screen">
-  <div class="post-handle"></div>
-  <div class="nfc-title">카세트를 올려주세요</div>
-  <div class="nfc-arrow">▾</div>
-  <a class="nfc-hit" href="?action=nfc_done" target="_self">
-    <div class="nfc-ring"></div>
-    <div class="nfc-label">NFC 인식 영역</div>
-    <div class="nfc-sub">이 영역에 카세트를 올려주세요</div>
-  </a>
-</div>
 """)
 
-elif page == "nfc_done":
-    if is_existing_edit_flow():
-        finish_existing_music_edit()
-        st.rerun()
-    html("""
-<style>
-.stApp { background:#efefef !important; }
-.block-container { max-width:760px !important; min-height:430px !important; margin:24px auto 0 !important; padding:0 !important; background:#fffaf7 !important; overflow:hidden !important; }
-header, [data-testid="stToolbar"], [data-testid="stDecoration"], #MainMenu, footer { display:none !important; }
-.nfc-screen { height:430px; display:flex; flex-direction:column; align-items:center; justify-content:center; text-align:center; background:radial-gradient(circle at 72% 92%, rgba(255,104,32,.25), transparent 35%), #fffaf7; }
-.post-handle { width:24px; height:3px; border-radius:999px; background:#cfc7c2; position:absolute; top:22px; left:50%; transform:translateX(-50%); }
-.done-title { font-size:15px; font-weight:900; margin-bottom:8px; }
-.done-sub { font-size:10px; color:#777; margin-bottom:18px; }
-.cassette { width:118px; height:52px; background:#d8d8d8; display:flex; align-items:center; justify-content:center; font-size:12px; color:#555; margin-bottom:26px; }
-.nfc-ring { width:150px; height:82px; border-radius:50%; border:1px solid rgba(255,139,69,.25); box-shadow:0 0 0 18px rgba(255,139,69,.04), 0 0 0 38px rgba(255,139,69,.03); background:radial-gradient(circle, rgba(255,139,69,.28), transparent 45%); margin-bottom:26px; }
-</style>
-<div class="nfc-screen">
-  <div class="post-handle"></div>
-  <div class="done-title">추억이 저장되었습니다</div>
-  <div class="done-sub">당신의 소중한 추억이 카세트에 저장되었어요</div>
-  <div class="cassette">카세트 이미지</div>
-  <div class="nfc-ring"></div>
-</div>
-""")
-    time.sleep(2.4)
-    go("video")
+    left_col, right_col = st.columns([0.46, 0.54], gap="large")
 
-elif page == "video":
-    base_memory = active_memory()
-    album_category = album_category_from_state(base_memory)
-    st.session_state.album_category = album_category
-    album_memories = album_memories_for_category(album_category)
-    if not album_memories and base_memory.get("photo"):
-        album_memories = [base_memory]
-
-    selected_album_id = (
-        st.session_state.get("album_selected_memory_id")
-        or st.session_state.get("selected_memory_id")
-        or base_memory.get("id")
-    )
-    if album_memories and selected_album_id not in [item.get("id") for item in album_memories]:
-        selected_album_id = album_memories[0].get("id")
-    if selected_album_id:
-        select_album_memory(selected_album_id)
-
-    memory = next(
-        (item for item in album_memories if item.get("id") == selected_album_id),
-        st.session_state.get("play_memory") or base_memory or {},
-    )
-    photo_path = photo_path_for_memory(memory) or active_photo_path(memory)
-    photo_src = image_src(photo_path)
-    photo = f'<img src="{photo_src}">' if photo_src else "▧"
-    handwriting_src = image_src(active_handwriting_path(memory))
-    handwriting = f'<img src="{handwriting_src}">' if handwriting_src else escape(memory.get("note") or st.session_state.memory_text or "")
-    track = memory.get("selected_track") or st.session_state.selected_track or {}
-    preview = track.get("preview_url") or ""
-    audio = (
-        f'<audio class="video-audio" controls src="{escape(preview, quote=True)}"></audio>'
-        if preview
-        else '<div class="fake-player"><div class="fake-line"><span></span></div><div class="fake-controls">× ‹ ● › ↻</div></div>'
-    )
-    summary = escape(memory_summary_text(memory))
-    thumb_css = []
-    for index, item in enumerate(album_memories):
-        thumb_src = image_src(photo_path_for_memory(item))
-        is_selected = item.get("id") == memory.get("id")
-        border = "3px solid #fff" if is_selected else "1px solid rgba(255,255,255,.80)"
-        shadow = "0 0 0 2px rgba(0,0,0,.14)" if is_selected else "none"
-        background = f'background-image:url("{escape(thumb_src, quote=True)}");' if thumb_src else ""
-        thumb_css.append(
-            f"""
-.st-key-video_thumb_{index} button {{
-  width:100% !important;
-  height:56px !important;
-  min-height:56px !important;
-  padding:0 !important;
-  border:{border} !important;
-  border-radius:6px !important;
-  background-color:#d8d8d8 !important;
-  {background}
-  background-size:cover !important;
-  background-position:center !important;
-  box-shadow:{shadow} !important;
-}}
-.st-key-video_thumb_{index} button p {{ display:none !important; }}
-"""
-        )
-    thumb_css = "\n".join(thumb_css)
-    html(f"""
-<style>
-.stApp {{ background:#efefef !important; }}
-.block-container {{ max-width:780px !important; min-height:500px !important; margin:18px auto 0 !important; padding:18px 32px 24px !important; background:#fffaf7 !important; overflow:hidden !important; }}
-header, [data-testid="stToolbar"], [data-testid="stDecoration"], #MainMenu, footer {{ display:none !important; }}
-.post-handle {{ width:24px; height:3px; border-radius:999px; background:#cfc7c2; margin:0 auto 22px; }}
-.video-photo {{ border-radius:10px; background:#fff; box-shadow:0 10px 24px rgba(0,0,0,.08); padding:12px; min-height:348px; }}
-.video-photo img {{ width:100%; height:315px; object-fit:contain; display:block; }}
-.thumb-spacer {{ height:8px; }}
-.side-card {{ border-radius:10px; background:#fff; box-shadow:0 10px 24px rgba(0,0,0,.08); padding:12px; margin-bottom:10px; }}
-.side-card.note {{ min-height:132px; font-size:22px; text-align:center; }}
-.note-title {{ font-size:11px; font-weight:900; text-align:left; margin-bottom:8px; }}
-.note-body {{ min-height:92px; display:flex; align-items:center; justify-content:center; overflow:hidden; }}
-.side-card.note img {{ max-width:100%; max-height:96px; object-fit:contain; display:block; }}
-.song-card {{ background:#ffe7dd; }}
-.song-title {{ font-size:13px; font-weight:900; margin-bottom:6px; }}
-.video-audio {{ width:100%; height:34px; margin-top:8px; }}
-.fake-player {{ margin-top:12px; }}
-.fake-line {{ height:2px; background:rgba(0,0,0,.18); position:relative; margin-bottom:10px; }}
-.fake-line span {{ position:absolute; left:0; top:0; bottom:0; width:62%; background:#ef7d34; }}
-.fake-controls {{ display:flex; justify-content:center; gap:12px; align-items:center; font-size:13px; font-weight:900; }}
-{thumb_css}
-.st-key-video_prev_button button,
-.st-key-video_next_button button {{ height:46px !important; border-radius:999px !important; background:#fff !important; color:#111 !important; border:0 !important; box-shadow:0 8px 18px rgba(0,0,0,.10) !important; font-size:15px !important; font-weight:900 !important; }}
-</style>
-<div class="post-handle"></div>
-""")
-    video_left, video_right = st.columns([1.48, 0.58], gap="large")
-    with video_left:
-        html(f'<div class="video-photo">{photo}</div><div class="thumb-spacer"></div>')
-        for row_start in range(0, len(album_memories), 5):
-            row = album_memories[row_start:row_start + 5]
-            thumb_cols = st.columns(5, gap="small")
-            for offset, item in enumerate(row):
-                index = row_start + offset
-                with thumb_cols[offset]:
-                    st.button(
-                        " ",
-                        key=f"video_thumb_{index}",
-                        on_click=select_album_memory,
-                        args=(item.get("id"),),
-                        use_container_width=True,
-                    )
-    with video_right:
+    with left_col:
         html(f"""
-<div class="side-card song-card">
-  <div class="song-title">{escape(track.get("title") or "노래 제목")}</div>
-  <div style="font-size:11px; color:#777; margin-bottom:8px;">{escape(track.get("artist") or "가수")}</div>
-  {audio}
-</div>
-<div class="side-card note"><div class="note-title">손글씨 기록</div><div class="note-body">{handwriting}</div></div>
-<div class="side-card" style="font-size:11px; line-height:1.5; background:#ffe4eb;"><b>AI 요약</b><br>{summary}</div>
+<div class="music-left-title"><span>♪</span> 이 추억에 어울리는 음악</div>
+<div class="music-left-sub">AI가 추억의 분위기와 내용을 바탕으로 선곡했어요.</div>
+<div class="music-photo-card">{photo_html}</div>
 """)
-    video_prev_col, video_gap_col, video_next_col = st.columns([0.28, 0.44, 0.28])
-    with video_prev_col:
-        if st.button("‹ 이전", key="video_prev_button", use_container_width=True):
-            go("album_done")
-    with video_next_col:
-        if st.button("다음 ›", key="video_next_button", use_container_width=True):
-            go("home")
+        if selected_track:
+            html(f"""
+<div class="music-player-card">
+  <div class="music-card-header">
+    <b>{escape(selected_track.get("title") or "노래 제목")}</b>
+    <span>{escape(selected_track.get("artist") or "가수")}</span>
+  </div>
+  <div class="music-player-main">
+    {cover_html(selected_track, "music-cover-large")}
+    <div class="music-player-lyrics">{lyrics_markup(selected_track)}</div>
+  </div>
+  <div class="music-card-progress"><span></span></div>
+  <div class="music-player-controls">
+    <div>◀</div>
+    <div class="music-play-circle">Ⅱ</div>
+    <div>▶</div>
+    <div></div>
+    <div>⤨</div>
+    <div>↻</div>
+  </div>
+</div>
+""")
+            if selected_track.get("preview_url"):
+                st.audio(selected_track["preview_url"], format="audio/mp3")
+        else:
+            html("""
+<div class="music-empty-card">
+  <b>음악을 선택해주세요.</b>
+  <span>오른쪽 추천 목록에서 +를 눌러보세요.</span>
+</div>
+""")
 
-elif page == "player":
-    go("video")
+    with right_col:
+        html(f'<div class="music-right-title">{screen_title}</div>')
+        query = st.text_input(
+            "음악 검색",
+            value=st.session_state.get("spotify_query", ""),
+            placeholder="어울리는 노래를 검색하세요.",
+            label_visibility="collapsed",
+            key="music_search_input",
+        )
+        st.session_state.spotify_query = query
 
-elif page == "player_legacy":
-    memory = st.session_state.play_memory or (memories[0] if memories else {})
-    src = image_src(memory.get("photo") or st.session_state.photo_path)
-    image = f'<img src="{src}">' if src else "▧"
-    track = memory.get("selected_track") or st.session_state.selected_track or {}
-    title = escape(track.get("title") or "19XX년대의 추억")
-    artist = escape(track.get("artist") or "Re:Play")
-    note = escape(memory.get("note") or st.session_state.memory_text or "아직 기록된 문장이 없어요.")
-    handwriting = (
-        memory.get("handwriting")
-        or st.session_state.handwriting_path
-        or handwriting_path_for(memory.get("id") or st.session_state.memory_id)
-    )
-    handwriting_src = image_src(handwriting)
-    handwriting_preview = (
-        f'<div class="review-label" style="margin-top:14px;">저장된 손글씨</div><div class="review-handwriting"><img src="{handwriting_src}"></div>'
-        if handwriting_src
+        search_text = str(query or "").strip()
+        if search_text:
+            # 검색어가 있으면 현재 추천 리스트를 필터링만 하지 말고 Spotify 검색을 새로 실행한다.
+            # 이전 검색어와 같으면 결과를 캐시해서 매 rerun마다 API를 반복 호출하지 않는다.
+            if st.session_state.get("music_last_search_query") != search_text:
+                st.session_state.music_search_results = spotify_recommendations(search_text)
+                st.session_state.music_last_search_query = search_text
+                st.session_state.music_show_more = False
+            visible_tracks = [normalized_music_track(track) for track in st.session_state.get("music_search_results", [])]
+            list_title = "검색 결과"
+        else:
+            st.session_state.music_last_search_query = ""
+            st.session_state.music_search_results = []
+            visible_tracks = [normalized_music_track(track) for track in tracks]
+            list_title = "AI 추천 음악"
+
+        html(f'<div class="music-list-title">{list_title}</div>')
+
+        if not visible_tracks:
+            # 그래도 비어 있으면 화면이 깨지거나 빈칸이 되지 않게 기본 추천으로 fallback
+            visible_tracks = [normalized_music_track(track) for track in spotify_recommendations(photo_music_query(memory))]
+            if search_text:
+                st.warning("검색 결과가 없어 기본 추천 음악을 보여드려요.")
+
+        visible_count = len(visible_tracks) if st.session_state.get("music_show_more") else min(5, len(visible_tracks))
+        for index, track in enumerate(visible_tracks[:visible_count]):
+            track = normalized_music_track(track)
+            is_selected = (
+                selected_track
+                and selected_track.get("title") == track.get("title")
+                and selected_track.get("artist") == track.get("artist")
+            )
+            row_cols = st.columns([0.075, 0.82, 0.105], gap="small")
+            with row_cols[0]:
+                html(f'<div class="music-row-spacer">{cover_html(track)}</div>')
+            with row_cols[1]:
+                html(f"""
+<div class="music-row-spacer">
+  <div>
+    <div class="music-track-title">{escape(track.get("title") or "노래 제목")}</div>
+    <div class="music-track-artist">By {escape(track.get("artist") or "가수")}</div>
+  </div>
+</div>
+""")
+            with row_cols[2]:
+                if st.button("✓" if is_selected else "+", key=f"music_select_track_{index}", use_container_width=True):
+                    selected = normalized_music_track(track)
+                    selected["lyrics"] = get_lyrics_from_lrclib(
+                        selected.get("title", ""),
+                        selected.get("artist", ""),
+                    )
+                    st.session_state.selected_track = selected
+                    st.session_state.music_notice = ""
+                    st.rerun()
+            if index < visible_count - 1:
+                html('<div class="music-row-line"></div>')
+
+        if len(visible_tracks) > 5:
+            more_label = "접기" if st.session_state.get("music_show_more") else "더 많은 음악 보기  ⌄"
+            if st.button(more_label, key="music_more_button", use_container_width=True):
+                st.session_state.music_show_more = not st.session_state.get("music_show_more")
+                st.rerun()
+        else:
+            html('<div style="height:48px"></div>')
+
+        notice = st.session_state.get("music_notice", "")
+        html(f'<div class="music-notice">{escape(notice)}</div>')
+
+        if st.button("음악 추가하기", key="music_add_done", use_container_width=True):
+            if not st.session_state.get("selected_track"):
+                st.session_state.music_notice = "음악을 먼저 선택해주세요."
+                st.rerun()
+            st.session_state.selected_track = normalized_music_track(st.session_state.selected_track)
+            if not st.session_state.selected_track.get("lyrics") or st.session_state.selected_track.get("lyrics") == DEFAULT_TRACK_LYRICS:
+                st.session_state.selected_track["lyrics"] = get_lyrics_from_lrclib(
+                    st.session_state.selected_track.get("title", ""),
+                    st.session_state.selected_track.get("artist", ""),
+                )
+            edit_memory_id = st.session_state.get("editing_memory_id")
+            if edit_memory_id and st.session_state.get("edit_mode") == "music_edit":
+                if update_memory_track(edit_memory_id, st.session_state.selected_track):
+                    finish_existing_music_edit()
+                    st.rerun()
+                st.session_state.music_notice = "음악을 저장할 기존 기록을 찾지 못했어요."
+                st.rerun()
+            if save_selected_track_to_current_memory():
+                st.session_state.page = "music_done"
+                st.rerun()
+            st.rerun()
+
+
+
+elif page == "play_fullscreen":
+    # Fullscreen slideshow for the current NFC cassette/category.
+    # - No bottom overlay box
+    # - Show text records only as subtitle-style captions
+    # - Photos without text stay 4.5s
+    # - Photos with text stay until all caption sentences are read
+    active_nfc = current_nfc_category()
+    playback_memories = st.session_state.get("playback_memories") or memories_for_current_nfc(load_memories(), active_nfc)
+    playback_memories = [memory for memory in playback_memories if media_reference_available(photo_path_for_memory(memory))]
+    if not playback_memories:
+        st.session_state.page = "home"
+        st.rerun()
+
+    def playback_text_from_memory(memory):
+        """Return only user-written/converted text for subtitle playback.
+
+        Handwriting images and AI summaries are not treated as subtitles here.
+        """
+        memory = memory or {}
+        candidates = [
+            memory.get("text_record"),
+            memory.get("text"),
+            memory.get("transcript"),
+            memory.get("voice_text"),
+            memory.get("audio_text"),
+            memory.get("record_text"),
+            memory.get("note"),
+            memory.get("memo"),
+            memory.get("description"),
+        ]
+        for value in candidates:
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        # Some versions save answers as a list/dict.
+        answers = memory.get("answers") or memory.get("question_answers")
+        if isinstance(answers, dict):
+            joined = " ".join(str(v).strip() for v in answers.values() if str(v).strip())
+            if joined.strip():
+                return joined.strip()
+        if isinstance(answers, list):
+            joined = " ".join(str(v).strip() for v in answers if str(v).strip())
+            if joined.strip():
+                return joined.strip()
+        return ""
+
+    def split_caption_sentences(text_value):
+        text_value = re.sub(r"\s+", " ", str(text_value or "").strip())
+        if not text_value:
+            return []
+        # Korean/English sentence split. Keep punctuation attached.
+        pieces = re.split(r"(?<=[.!?。！？])\s+|(?<=[다요죠까])\s+", text_value)
+        cleaned = []
+        for piece in pieces:
+            piece = piece.strip()
+            if not piece:
+                continue
+            # If a sentence is too long, split softly by comma-like marks.
+            if len(piece) > 54:
+                subpieces = re.split(r"(?<=[,，、])\s*", piece)
+                buffer = ""
+                for sub in subpieces:
+                    sub = sub.strip()
+                    if not sub:
+                        continue
+                    if len(buffer + " " + sub) <= 48:
+                        buffer = (buffer + " " + sub).strip()
+                    else:
+                        if buffer:
+                            cleaned.append(buffer)
+                        buffer = sub
+                if buffer:
+                    cleaned.append(buffer)
+            else:
+                cleaned.append(piece)
+        return cleaned[:12]
+
+    def caption_duration(sentence):
+        length = len(str(sentence or "").replace(" ", ""))
+        return min(7.0, max(4.0, length * 0.18))
+
+    no_caption_seconds = 4.5
+    song_seconds = 28.0
+
+    now = time.time()
+    current_index = int(st.session_state.get("playback_index") or 0)
+    if current_index >= len(playback_memories):
+        current_index = 0
+        st.session_state.playback_index = 0
+
+    current_memory = playback_memories[current_index]
+    captions = split_caption_sentences(playback_text_from_memory(current_memory))
+
+    caption_index = int(st.session_state.get("playback_caption_index") or 0)
+    if caption_index >= len(captions):
+        caption_index = 0
+        st.session_state.playback_caption_index = 0
+
+    slide_started_at = float(st.session_state.get("playback_started_at") or now)
+    caption_started_at = float(st.session_state.get("playback_caption_started_at") or slide_started_at or now)
+
+    if captions:
+        current_caption = captions[caption_index]
+        if now - caption_started_at >= caption_duration(current_caption):
+            caption_index += 1
+            if caption_index >= len(captions):
+                current_index += 1
+                if current_index >= len(playback_memories):
+                    st.session_state.playback_memories = []
+                    st.session_state.playback_index = 0
+                    st.session_state.playback_caption_index = 0
+                    st.session_state.page = "home"
+                    st.rerun()
+                st.session_state.playback_index = current_index
+                st.session_state.playback_started_at = now
+                st.session_state.playback_caption_index = 0
+                st.session_state.playback_caption_started_at = now
+                st.rerun()
+            else:
+                st.session_state.playback_caption_index = caption_index
+                st.session_state.playback_caption_started_at = now
+                st.rerun()
+    else:
+        current_caption = ""
+        if now - slide_started_at >= no_caption_seconds:
+            current_index += 1
+            if current_index >= len(playback_memories):
+                st.session_state.playback_memories = []
+                st.session_state.playback_index = 0
+                st.session_state.playback_caption_index = 0
+                st.session_state.page = "home"
+                st.rerun()
+            st.session_state.playback_index = current_index
+            st.session_state.playback_started_at = now
+            st.session_state.playback_caption_index = 0
+            st.session_state.playback_caption_started_at = now
+            st.rerun()
+
+    current_memory = playback_memories[int(st.session_state.get("playback_index") or 0)]
+    current_photo_src = image_src(photo_path_for_memory(current_memory))
+    current_index = int(st.session_state.get("playback_index") or 0)
+    captions = split_caption_sentences(playback_text_from_memory(current_memory))
+    caption_index = int(st.session_state.get("playback_caption_index") or 0)
+    current_caption = captions[caption_index] if captions and caption_index < len(captions) else ""
+
+    # 대표 노래: current NFC category 안의 selected_track 중 첫 번째로 시작.
+    # song_seconds 이후에는 같은 리스트에서 순환 재생.
+    tracks = []
+    seen_tracks = set()
+    for memory in playback_memories:
+        track = memory.get("selected_track") or {}
+        title = str(track.get("title") or "").strip()
+        artist = str(track.get("artist") or "").strip()
+        key = (title, artist)
+        if title and key not in seen_tracks:
+            seen_tracks.add(key)
+            tracks.append(track)
+
+    current_track = tracks[0] if tracks else {}
+    if tracks:
+        song_index = int(st.session_state.get("playback_song_index") or 0) % len(tracks)
+        song_started_at = float(st.session_state.get("playback_song_started_at") or now)
+        if now - song_started_at >= song_seconds:
+            song_index = (song_index + 1) % len(tracks)
+            st.session_state.playback_song_index = song_index
+            st.session_state.playback_song_started_at = now
+            st.rerun()
+        current_track = tracks[song_index]
+
+    photo_tag = f'<img class="play-full-photo" src="{escape(current_photo_src, quote=True)}" alt="">' if current_photo_src else ""
+    caption_html = (
+        f'<div class="play-caption">{escape(current_caption)}</div>'
+        if current_caption
         else ""
     )
-    preview = track.get("preview_url") or ""
-    audio = f'<audio class="audio-player" controls src="{preview}"></audio>' if preview else ""
-    delete_id = memory.get("id") or st.session_state.memory_id
-    delete_link = f'<a class="delete-pill" href="?action=delete&memory={delete_id}" target="_self">삭제</a>' if delete_id else ""
+    exit_href = "?action=playback_exit"
+
     html(f"""
-<div class="app-card player">
-  <div class="topbar" style="position:absolute; top:28px; width:calc(100% - 88px);"><a class="back" href="?action=back" target="_self">‹</a><div class="center"></div><div></div></div>
-  <div class="record-scene"><div class="play-photo">{image}</div><div class="small-record"></div></div>
-  <div class="song-name">&lt;{title}&gt;</div>
-  <div class="memory-review">
-    <div class="review-label">기록한 기억</div>
-    <div class="review-note">{note}</div>
-    {handwriting_preview}
-    <div class="music-chip">♪ {title} - {artist}</div>
-    {audio}
+<style>
+html, body, .stApp {{
+    margin:0 !important;
+    width:100vw !important;
+    height:100vh !important;
+    overflow:hidden !important;
+    background:#000 !important;
+}}
+.stApp {{
+    background:#000 !important;
+    color:#fff !important;
+}}
+.stApp .block-container {{
+    width:1180px !important;
+    min-width:1180px !important;
+    max-width:1180px !important;
+    height:760px !important;
+    min-height:760px !important;
+    max-height:760px !important;
+    margin:0 auto !important;
+    padding:0 !important;
+    overflow:hidden !important;
+    background:#000 !important;
+    position:relative !important;
+}}
+header, [data-testid="stToolbar"], [data-testid="stDecoration"], #MainMenu, footer {{
+    display:none !important;
+}}
+div[data-testid="stVerticalBlock"] {{
+    gap:0 !important;
+}}
+.play-fullscreen {{
+    width:1180px;
+    height:760px;
+    background:#000;
+    position:relative;
+    overflow:hidden;
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+    justify-content:center;
+}}
+.play-photo-wrap {{
+    position:relative;
+    width:960px;
+    height:560px;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    overflow:hidden;
+    background:#000;
+    flex:0 0 auto;
+}}
+.play-full-photo {{
+    width:100%;
+    height:100%;
+    object-fit:contain;
+    display:block;
+}}
+.play-full-counter {{
+    position:absolute;
+    right:16px;
+    top:14px;
+    z-index:6;
+    padding:5px 9px;
+    border-radius:999px;
+    background:rgba(0,0,0,.42);
+    color:#fff;
+    font-size:12px;
+    line-height:1;
+    font-weight:900;
+}}
+.play-caption {{
+    position:absolute;
+    left:50%;
+    bottom:30px;
+    transform:translateX(-50%);
+    z-index:7;
+    max-width:82%;
+    padding:10px 18px 11px;
+    border-radius:10px;
+    background:rgba(0,0,0,.55);
+    color:#fff;
+    font-size:25px;
+    line-height:1.35;
+    font-weight:900;
+    letter-spacing:-.2px;
+    text-align:center;
+    text-shadow:0 2px 8px rgba(0,0,0,.55);
+    word-break:keep-all;
+}}
+.play-exit-link {{
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    width:116px;
+    height:42px;
+    margin-top:38px;
+    border-radius:999px;
+    background:rgba(255,255,255,.92);
+    color:#111 !important;
+    font-size:13px;
+    line-height:1;
+    font-weight:1000;
+    text-decoration:none !important;
+    box-shadow:0 10px 24px rgba(0,0,0,.22);
+    flex:0 0 auto;
+}}
+div[data-testid="stAudio"] {{
+    position:absolute !important;
+    left:30px !important;
+    bottom:24px !important;
+    width:360px !important;
+    z-index:20 !important;
+    opacity:.22 !important;
+}}
+</style>
+<div class="play-fullscreen">
+  <div class="play-photo-wrap">
+    {photo_tag}
+    <div class="play-full-counter">{current_index + 1} / {len(playback_memories)}</div>
+    {caption_html}
   </div>
-  <div class="player-actions">
-    <a class="pill" href="?action=home" target="_self">처음으로</a>
-    {delete_link}
-  </div>
+  <a class="play-exit-link" href="{exit_href}" target="_self">종료</a>
 </div>
 """)
+
+    audio_src = (current_track or {}).get("file") or (current_track or {}).get("preview_url") or ""
+    if audio_src:
+        st.audio(audio_src, format="audio/mp3")
+
+    time.sleep(0.4)
+    st.rerun()
+
+
+elif page == "music_done":
+    html("""
+<style>
+html, body, .stApp {
+    margin:0 !important;
+    width:100vw !important;
+    height:100vh !important;
+    overflow:hidden !important;
+}
+.stApp {
+    background:#777 !important;
+    color:#111 !important;
+}
+.stApp .block-container {
+    width:1180px !important;
+    min-width:1180px !important;
+    max-width:1180px !important;
+    height:760px !important;
+    min-height:760px !important;
+    max-height:760px !important;
+    margin:0 auto !important;
+    padding:0 !important;
+    overflow:hidden !important;
+    background:
+        radial-gradient(circle at 108% 88%, rgba(255,104,35,.25), transparent 30%),
+        linear-gradient(135deg, #fbfbfb 0%, #faf9f7 58%, #fff3ef 100%) !important;
+    position:relative !important;
+}
+header, [data-testid="stToolbar"], [data-testid="stDecoration"], #MainMenu, footer {
+    display:none !important;
+}
+div[data-testid="stVerticalBlock"] {
+    gap:0 !important;
+}
+.music-done-title {
+    width:100%;
+    text-align:center;
+    color:#111;
+    font-size:22px;
+    line-height:1.2;
+    font-weight:1000;
+    letter-spacing:-.2px;
+    margin-top:337px;
+    margin-bottom:74px;
+}
+.st-key-music_done_home button,
+.st-key-music_done_continue button {
+    height:62px !important;
+    min-height:62px !important;
+    border-radius:7px !important;
+    border:0 !important;
+    box-shadow:0 10px 22px rgba(0,0,0,.10) !important;
+    font-size:15px !important;
+    font-weight:1000 !important;
+}
+.st-key-music_done_home button {
+    background:#fff !important;
+    color:#111 !important;
+}
+.st-key-music_done_continue button {
+    background:#050505 !important;
+    color:#fff !important;
+}
+</style>
+<div class="music-done-title">음악이 추가되었습니다!</div>
+""")
+    spacer_l, home_col, spacer_mid, continue_col, spacer_r = st.columns([1.55, 1.05, 0.28, 1.05, 1.55], gap="small")
+    with home_col:
+        if st.button("홈으로", key="music_done_home", use_container_width=True):
+            st.session_state.page = "home"
+            st.session_state.home_tab = "album"
+            st.rerun()
+    with continue_col:
+        if st.button("이어서 기록하기", key="music_done_continue", use_container_width=True):
+            reset_flow()
+            st.session_state.page = "scan_upload"
+            st.rerun()
+
+
+elif page in ("category_loading", "category_edit", "album_done", "nfc_scan", "nfc_done", "video", "player", "player_legacy"):
+    # 현재 프로토타입에서는 사용하지 않는 옛 화면들:
+    # - AI 추억 카테고리 생성
+    # - 카테고리 수정
+    # - 앨범 생성 완료
+    # - 옛 NFC 후속 화면
+    # - 영상/재생 화면
+    # 필요하면 나중에 이 파일의 이전 버전에서 복구 가능.
+    st.session_state.page = "home"
+    st.rerun()
