@@ -801,8 +801,12 @@ def sync_answer_to_memory_text():
     for index, question in enumerate(questions[:3]):
         answer = str(answers.get(str(index), "")).strip()
         if answer:
-            lines.append(f"Q{index + 1}. {question}\n{answer}")
-    st.session_state.memory_text = "\n\n".join(lines)
+            question_text = str(question or "").strip()
+            if question_text:
+                lines.append(f"Q{index + 1}. {question_text}\n{answer}")
+            else:
+                lines.append(answer)
+    st.session_state.memory_text = "\n\n".join(lines).strip()
     return st.session_state.memory_text
 
 
@@ -862,7 +866,11 @@ def update_existing_memory_from_write(memory_id):
         or (memory["questions"][0] if memory.get("questions") else memory.get("question", ""))
     )
     memory["question_answers"] = ensure_question_answers()
-    memory["note"] = st.session_state.get("memory_text", "")
+    sync_answer_to_memory_text()
+    note_text = st.session_state.get("memory_text", "").strip()
+    if not note_text:
+        note_text = memory_question_answer_text(memory, include_questions=True)
+    memory["note"] = note_text
     if handwriting:
         memory["handwriting"] = handwriting
 
@@ -981,6 +989,16 @@ def save_memory(include_summary=True):
         categories.insert(0, nfc_category)
     st.session_state.selected_category = nfc_category
 
+    # 질문 3개에 입력한 답변이 note에 비어 저장되는 문제 방지
+    sync_answer_to_memory_text()
+    note_text = st.session_state.get("memory_text", "").strip()
+    if not note_text:
+        temp_memory_for_note = {
+            "questions": st.session_state.get("questions") or [],
+            "question_answers": ensure_question_answers(),
+        }
+        note_text = memory_question_answer_text(temp_memory_for_note, include_questions=True)
+
     data = {
         "id": st.session_state.memory_id,
         "nfc_uid": st.session_state.get("nfc_uid", ""),
@@ -993,7 +1011,7 @@ def save_memory(include_summary=True):
         "questions": st.session_state.questions,
         "suggested_categories": st.session_state.suggested_categories,
         "music_query": st.session_state.music_query,
-        "note": st.session_state.memory_text,
+        "note": note_text,
         "question_answers": ensure_question_answers(),
         "handwriting": handwriting,
         "selected_track": st.session_state.selected_track,
@@ -1066,8 +1084,66 @@ def memory_title(memory):
     return "이름 없는 추억"
 
 
+def memory_question_answer_text(memory, include_questions=False):
+    """Return text recorded through the 3 question flow.
+
+    Some records have answers saved in question_answers but note is empty.
+    This makes home cards, edit pages, and playback subtitles still show them.
+    """
+    memory = memory or {}
+    answers = memory.get("question_answers") or memory.get("answers")
+    questions = memory.get("questions") or []
+
+    lines = []
+    if isinstance(answers, dict):
+        def answer_sort_key(item):
+            key, _ = item
+            try:
+                return int(key)
+            except Exception:
+                return 999
+
+        for key, answer in sorted(answers.items(), key=answer_sort_key):
+            answer_text = str(answer or "").strip()
+            if not answer_text:
+                continue
+            if include_questions:
+                try:
+                    q_index = int(key)
+                except Exception:
+                    q_index = len(lines)
+                question = str(questions[q_index] if q_index < len(questions) else "").strip()
+                if question:
+                    lines.append(f"Q{q_index + 1}. {question}\n{answer_text}")
+                else:
+                    lines.append(answer_text)
+            else:
+                lines.append(answer_text)
+
+    elif isinstance(answers, list):
+        for index, answer in enumerate(answers):
+            answer_text = str(answer or "").strip()
+            if not answer_text:
+                continue
+            if include_questions:
+                question = str(questions[index] if index < len(questions) else "").strip()
+                lines.append(f"Q{index + 1}. {question}\n{answer_text}" if question else answer_text)
+            else:
+                lines.append(answer_text)
+
+    return "\n\n".join(lines).strip()
+
+
+def memory_record_text(memory, include_questions=False):
+    """Prefer note, but fall back to the 3 question answers."""
+    note = str((memory or {}).get("note") or "").strip()
+    if note:
+        return note
+    return memory_question_answer_text(memory, include_questions=include_questions)
+
+
 def memory_note_preview(memory, limit=32):
-    note = " ".join(str(memory.get("note") or "").split())
+    note = " ".join(memory_record_text(memory, include_questions=False).split())
     if not note:
         return "아직 기록된 문장이 없어요."
     return note if len(note) <= limit else f"{note[:limit]}..."
@@ -3942,7 +4018,7 @@ div[data-testid="stTextArea"] textarea { min-height:140px !important; resize:non
 </div>
 """)
     title_value = st.text_input("제목", value=str(edit_memory.get("title") or ""), key=f"edit_title_{edit_id}")
-    note_value = st.text_area("기록 내용", value=str(edit_memory.get("note") or ""), key=f"edit_note_{edit_id}", height=140)
+    note_value = st.text_area("기록 내용", value=str(memory_record_text(edit_memory, include_questions=True) or ""), key=f"edit_note_{edit_id}", height=140)
     category_value = st.text_input(
         "카테고리",
         value=", ".join(edit_categories),
@@ -6031,6 +6107,7 @@ elif page == "play_fullscreen":
         """
         memory = memory or {}
         candidates = [
+            memory_record_text(memory, include_questions=False),
             memory.get("text_record"),
             memory.get("text"),
             memory.get("transcript"),
