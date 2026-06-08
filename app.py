@@ -10,6 +10,7 @@ from urllib.parse import quote
 
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 from dotenv import load_dotenv
 from PIL import Image
 from streamlit_drawable_canvas import st_canvas
@@ -6312,11 +6313,9 @@ div[data-testid="stAudio"] {
 
 
 elif page == "play_fullscreen":
-    # Fullscreen slideshow for the current NFC cassette/category.
-    # - No bottom overlay box
-    # - Show text records only as subtitle-style captions
-    # - Photos without text stay 4.5s
-    # - Photos with text stay until all caption sentences are read
+    # Flicker-free slideshow:
+    # 이전 버전은 0.4초마다 st.rerun()을 해서 화면이 검게 깜빡였음.
+    # 여기서는 한 번만 렌더링하고, 사진/자막 전환은 브라우저 JS가 처리한다.
     active_nfc = current_nfc_category()
     playback_memories = st.session_state.get("playback_memories") or memories_for_current_nfc(load_memories(), active_nfc)
     playback_memories = [memory for memory in playback_memories if media_reference_available(photo_path_for_memory(memory))]
@@ -6325,10 +6324,6 @@ elif page == "play_fullscreen":
         st.rerun()
 
     def playback_text_from_memory(memory):
-        """Return only user-written/converted text for subtitle playback.
-
-        Handwriting images and AI summaries are not treated as subtitles here.
-        """
         memory = memory or {}
         candidates = [
             memory_record_text(memory, include_questions=False),
@@ -6345,7 +6340,6 @@ elif page == "play_fullscreen":
         for value in candidates:
             if isinstance(value, str) and value.strip():
                 return value.strip()
-        # Some versions save answers as a list/dict.
         answers = memory.get("answers") or memory.get("question_answers")
         if isinstance(answers, dict):
             joined = " ".join(str(v).strip() for v in answers.values() if str(v).strip())
@@ -6361,14 +6355,12 @@ elif page == "play_fullscreen":
         text_value = re.sub(r"\s+", " ", str(text_value or "").strip())
         if not text_value:
             return []
-        # Korean/English sentence split. Keep punctuation attached.
         pieces = re.split(r"(?<=[.!?。！？])\s+|(?<=[다요죠까])\s+", text_value)
         cleaned = []
         for piece in pieces:
             piece = piece.strip()
             if not piece:
                 continue
-            # If a sentence is too long, split softly by comma-like marks.
             if len(piece) > 54:
                 subpieces = re.split(r"(?<=[,，、])\s*", piece)
                 buffer = ""
@@ -6392,72 +6384,28 @@ elif page == "play_fullscreen":
         length = len(str(sentence or "").replace(" ", ""))
         return min(7.0, max(4.0, length * 0.18))
 
-    no_caption_seconds = 4.5
-    song_seconds = 28.0
+    # 사진 1장당 여러 자막 문장이 있을 수 있으므로 JS용 step으로 펼친다.
+    steps = []
+    for photo_index, memory in enumerate(playback_memories):
+        photo_src = image_src(photo_path_for_memory(memory))
+        captions = split_caption_sentences(playback_text_from_memory(memory))
+        if captions:
+            for caption in captions:
+                steps.append({
+                    "photo": photo_src,
+                    "caption": caption,
+                    "duration": int(caption_duration(caption) * 1000),
+                    "counter": f"{photo_index + 1} / {len(playback_memories)}",
+                })
+        else:
+            steps.append({
+                "photo": photo_src,
+                "caption": "",
+                "duration": 4500,
+                "counter": f"{photo_index + 1} / {len(playback_memories)}",
+            })
 
-    now = time.time()
-    current_index = int(st.session_state.get("playback_index") or 0)
-    if current_index >= len(playback_memories):
-        current_index = 0
-        st.session_state.playback_index = 0
-
-    current_memory = playback_memories[current_index]
-    captions = split_caption_sentences(playback_text_from_memory(current_memory))
-
-    caption_index = int(st.session_state.get("playback_caption_index") or 0)
-    if caption_index >= len(captions):
-        caption_index = 0
-        st.session_state.playback_caption_index = 0
-
-    slide_started_at = float(st.session_state.get("playback_started_at") or now)
-    caption_started_at = float(st.session_state.get("playback_caption_started_at") or slide_started_at or now)
-
-    if captions:
-        current_caption = captions[caption_index]
-        if now - caption_started_at >= caption_duration(current_caption):
-            caption_index += 1
-            if caption_index >= len(captions):
-                current_index += 1
-                if current_index >= len(playback_memories):
-                    st.session_state.playback_memories = []
-                    st.session_state.playback_index = 0
-                    st.session_state.playback_caption_index = 0
-                    st.session_state.page = "home"
-                    st.rerun()
-                st.session_state.playback_index = current_index
-                st.session_state.playback_started_at = now
-                st.session_state.playback_caption_index = 0
-                st.session_state.playback_caption_started_at = now
-                st.rerun()
-            else:
-                st.session_state.playback_caption_index = caption_index
-                st.session_state.playback_caption_started_at = now
-                st.rerun()
-    else:
-        current_caption = ""
-        if now - slide_started_at >= no_caption_seconds:
-            current_index += 1
-            if current_index >= len(playback_memories):
-                st.session_state.playback_memories = []
-                st.session_state.playback_index = 0
-                st.session_state.playback_caption_index = 0
-                st.session_state.page = "home"
-                st.rerun()
-            st.session_state.playback_index = current_index
-            st.session_state.playback_started_at = now
-            st.session_state.playback_caption_index = 0
-            st.session_state.playback_caption_started_at = now
-            st.rerun()
-
-    current_memory = playback_memories[int(st.session_state.get("playback_index") or 0)]
-    current_photo_src = image_src(photo_path_for_memory(current_memory))
-    current_index = int(st.session_state.get("playback_index") or 0)
-    captions = split_caption_sentences(playback_text_from_memory(current_memory))
-    caption_index = int(st.session_state.get("playback_caption_index") or 0)
-    current_caption = captions[caption_index] if captions and caption_index < len(captions) else ""
-
-    # 대표 노래: current NFC category 안의 selected_track 중 첫 번째로 시작.
-    # song_seconds 이후에는 같은 리스트에서 순환 재생.
+    # 대표 노래: 현재 NFC 카테고리 안의 첫 selected_track.
     tracks = []
     seen_tracks = set()
     for memory in playback_memories:
@@ -6468,41 +6416,23 @@ elif page == "play_fullscreen":
         if title and key not in seen_tracks:
             seen_tracks.add(key)
             tracks.append(track)
-
     current_track = tracks[0] if tracks else {}
-    if tracks:
-        song_index = int(st.session_state.get("playback_song_index") or 0) % len(tracks)
-        song_started_at = float(st.session_state.get("playback_song_started_at") or now)
-        if now - song_started_at >= song_seconds:
-            song_index = (song_index + 1) % len(tracks)
-            st.session_state.playback_song_index = song_index
-            st.session_state.playback_song_started_at = now
-            st.rerun()
-        current_track = tracks[song_index]
-
-    photo_tag = f'<img class="play-full-photo" src="{escape(current_photo_src, quote=True)}" alt="">' if current_photo_src else ""
-    caption_html = (
-        f'<div class="play-caption">{escape(current_caption)}</div>'
-        if current_caption
-        else ""
-    )
     play_audio_html = render_track_audio_html(current_track, autoplay=True, compact=True)
-    exit_href = "?action=playback_exit"
 
-    html(f"""
+    html("""
 <style>
-html, body, .stApp {{
+html, body, .stApp {
     margin:0 !important;
     width:100vw !important;
     height:100vh !important;
     overflow:hidden !important;
     background:#000 !important;
-}}
-.stApp {{
+}
+.stApp {
     background:#000 !important;
     color:#fff !important;
-}}
-.stApp .block-container {{
+}
+.stApp .block-container {
     width:1180px !important;
     min-width:1180px !important;
     max-width:1180px !important;
@@ -6514,120 +6444,212 @@ html, body, .stApp {{
     overflow:hidden !important;
     background:#000 !important;
     position:relative !important;
-}}
-header, [data-testid="stToolbar"], [data-testid="stDecoration"], #MainMenu, footer {{
+}
+header, [data-testid="stToolbar"], [data-testid="stDecoration"], #MainMenu, footer {
     display:none !important;
-}}
-div[data-testid="stVerticalBlock"] {{
+}
+div[data-testid="stVerticalBlock"] {
     gap:0 !important;
-}}
-.play-fullscreen {{
-    width:1180px;
-    height:760px;
-    background:#000;
-    position:relative;
-    overflow:hidden;
-    display:flex;
-    flex-direction:column;
-    align-items:center;
-    justify-content:center;
-}}
-.play-photo-wrap {{
-    position:relative;
-    width:960px;
-    height:560px;
-    display:flex;
-    align-items:center;
-    justify-content:center;
-    overflow:hidden;
-    background:#000;
-    flex:0 0 auto;
-}}
-.play-full-photo {{
-    width:100%;
-    height:100%;
-    object-fit:contain;
-    display:block;
-}}
-.play-full-counter {{
-    position:absolute;
-    right:16px;
-    top:14px;
-    z-index:6;
-    padding:5px 9px;
-    border-radius:999px;
-    background:rgba(0,0,0,.42);
-    color:#fff;
-    font-size:12px;
-    line-height:1;
-    font-weight:900;
-}}
-.play-caption {{
-    position:absolute;
-    left:50%;
-    bottom:30px;
-    transform:translateX(-50%);
-    z-index:7;
-    max-width:82%;
-    padding:10px 18px 11px;
-    border-radius:10px;
-    background:rgba(0,0,0,.55);
-    color:#fff;
-    font-size:25px;
-    line-height:1.35;
-    font-weight:900;
-    letter-spacing:-.2px;
-    text-align:center;
-    text-shadow:0 2px 8px rgba(0,0,0,.55);
-    word-break:keep-all;
-}}
-.play-exit-link {{
-    display:flex;
-    align-items:center;
-    justify-content:center;
-    width:116px;
-    height:42px;
-    margin-top:38px;
-    border-radius:999px;
-    background:rgba(255,255,255,.92);
-    color:#111 !important;
-    font-size:13px;
-    line-height:1;
-    font-weight:1000;
-    text-decoration:none !important;
-    box-shadow:0 10px 24px rgba(0,0,0,.22);
-    flex:0 0 auto;
-}}
-div[data-testid="stAudio"] {{
-    display:none !important;
-}}
-.native-audio.compact {{
-    position:absolute;
-    left:30px;
-    bottom:24px;
-    width:360px;
-    height:34px;
-    z-index:20;
-    opacity:.78;
-}}
-.native-audio.compact audio {{
-    width:360px;
-    height:34px;
-}}
+}
+iframe {
+    display:block !important;
+    border:0 !important;
+}
 </style>
-<div class="play-fullscreen">
-  <div class="play-photo-wrap">
-    {photo_tag}
-    <div class="play-full-counter">{current_index + 1} / {len(playback_memories)}</div>
-    {caption_html}
-  </div>
-  <a class="play-exit-link" href="{exit_href}" target="_self">종료</a>
-  {play_audio_html}
-</div>
 """)
 
-    time.sleep(0.4)
-    st.rerun()
+    slides_json = json.dumps(steps, ensure_ascii=False)
+    audio_json = json.dumps(play_audio_html, ensure_ascii=False)
+
+    component_markup = """
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+html, body {
+  margin:0;
+  width:1180px;
+  height:760px;
+  overflow:hidden;
+  background:#000;
+  font-family:Arial, 'Noto Sans KR', sans-serif;
+}
+.play-fullscreen {
+  width:1180px;
+  height:760px;
+  background:#000;
+  position:relative;
+  overflow:hidden;
+  display:flex;
+  flex-direction:column;
+  align-items:center;
+  justify-content:center;
+}
+.play-photo-wrap {
+  position:relative;
+  width:960px;
+  height:560px;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  overflow:hidden;
+  background:#000;
+  flex:0 0 auto;
+}
+.play-full-photo {
+  width:100%;
+  height:100%;
+  object-fit:contain;
+  display:block;
+  opacity:1;
+  transition:opacity .18s ease;
+}
+.play-full-counter {
+  position:absolute;
+  right:16px;
+  top:14px;
+  z-index:6;
+  padding:5px 9px;
+  border-radius:999px;
+  background:rgba(0,0,0,.42);
+  color:#fff;
+  font-size:12px;
+  line-height:1;
+  font-weight:900;
+}
+.play-caption {
+  position:absolute;
+  left:50%;
+  bottom:30px;
+  transform:translateX(-50%);
+  z-index:7;
+  max-width:82%;
+  padding:10px 18px 11px;
+  border-radius:10px;
+  background:rgba(0,0,0,.55);
+  color:#fff;
+  font-size:25px;
+  line-height:1.35;
+  font-weight:900;
+  letter-spacing:-.2px;
+  text-align:center;
+  text-shadow:0 2px 8px rgba(0,0,0,.55);
+  word-break:keep-all;
+  display:none;
+}
+.play-exit-link {
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  width:116px;
+  height:42px;
+  margin-top:38px;
+  border-radius:999px;
+  background:rgba(255,255,255,.92);
+  color:#111;
+  font-size:13px;
+  line-height:1;
+  font-weight:1000;
+  text-decoration:none;
+  box-shadow:0 10px 24px rgba(0,0,0,.22);
+  flex:0 0 auto;
+  border:0;
+  cursor:pointer;
+}
+.native-audio.compact {
+  position:absolute;
+  left:30px;
+  bottom:24px;
+  width:360px;
+  height:34px;
+  z-index:20;
+  opacity:.78;
+}
+.native-audio.compact audio {
+  width:360px;
+  height:34px;
+}
+</style>
+</head>
+<body>
+<div class="play-fullscreen">
+  <div class="play-photo-wrap">
+    <img id="slidePhoto" class="play-full-photo" src="" alt="">
+    <div id="slideCounter" class="play-full-counter"></div>
+    <div id="slideCaption" class="play-caption"></div>
+  </div>
+  <button class="play-exit-link" onclick="window.parent.location.href='?action=playback_exit'">종료</button>
+  <div id="audioMount"></div>
+</div>
+<script>
+const slides = __SLIDES_JSON__;
+const audioHtml = __AUDIO_HTML__;
+const photo = document.getElementById('slidePhoto');
+const counter = document.getElementById('slideCounter');
+const caption = document.getElementById('slideCaption');
+const audioMount = document.getElementById('audioMount');
+
+audioMount.innerHTML = audioHtml || "";
+
+// 사진을 미리 로드해서 전환 순간 검게 깜빡이는 걸 줄임
+const preloaded = {};
+slides.forEach((slide) => {
+  if (slide.photo && !preloaded[slide.photo]) {
+    const img = new Image();
+    img.src = slide.photo;
+    preloaded[slide.photo] = img;
+  }
+});
+
+let stepIndex = 0;
+let timer = null;
+
+function renderStep() {
+  if (!slides.length) {
+    window.parent.location.href = '?action=playback_exit';
+    return;
+  }
+
+  if (stepIndex >= slides.length) {
+    window.parent.location.href = '?action=playback_exit';
+    return;
+  }
+
+  const slide = slides[stepIndex];
+
+  // 같은 사진에서 자막만 바뀌는 경우 img src를 다시 넣지 않아서 깜빡임 방지
+  if (photo.getAttribute('src') !== slide.photo) {
+    photo.style.opacity = '0.98';
+    photo.src = slide.photo || "";
+    requestAnimationFrame(() => { photo.style.opacity = '1'; });
+  }
+
+  counter.textContent = slide.counter || "";
+  if (slide.caption) {
+    caption.textContent = slide.caption;
+    caption.style.display = "block";
+  } else {
+    caption.textContent = "";
+    caption.style.display = "none";
+  }
+
+  const duration = Math.max(2500, Number(slide.duration || 4500));
+  timer = setTimeout(() => {
+    stepIndex += 1;
+    renderStep();
+  }, duration);
+}
+
+renderStep();
+</script>
+</body>
+</html>
+"""
+    component_markup = component_markup.replace("__SLIDES_JSON__", slides_json)
+    component_markup = component_markup.replace("__AUDIO_HTML__", audio_json)
+
+    components.html(component_markup, height=760, scrolling=False)
 
 
 elif page == "music_done":
