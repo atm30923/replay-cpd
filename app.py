@@ -1724,7 +1724,6 @@ def list_music_files():
 
 
 def find_music_file_by_hint(*hints):
-    """Find an audio file in music/ even if the filename is slightly different."""
     files = list_music_files()
     if not files:
         return ""
@@ -1738,20 +1737,17 @@ def find_music_file_by_hint(*hints):
     hint_basenames = [os.path.basename(hint) for hint in hint_values]
     hint_keys = [normalize_filename_key(os.path.splitext(hint)[0]) for hint in hint_basenames + hint_values]
 
-    # 1) exact basename match
     for hint in hint_basenames:
         for name in files:
             if name == hint:
                 return os.path.join(MUSIC_DIR, name)
 
-    # 2) case-insensitive exact basename
     lower_to_name = {name.lower(): name for name in files}
     for hint in hint_basenames:
         picked = lower_to_name.get(hint.lower())
         if picked:
             return os.path.join(MUSIC_DIR, picked)
 
-    # 3) normalized stem contains/matches
     for name in files:
         name_key = normalize_filename_key(os.path.splitext(name)[0])
         for hint_key in hint_keys:
@@ -1764,15 +1760,12 @@ def find_music_file_by_hint(*hints):
 def expected_music_debug_text():
     files = list_music_files()
     if not files:
-        return "music 폴더가 비어 있거나, 배포된 서버에 music 파일이 없습니다."
+        return "music 폴더가 비어 있거나 서버에 music 파일이 없습니다."
     return "music 폴더 파일: " + ", ".join(files[:8])
 
 
 def resolve_audio_file_path(file_value, track=None):
-    """Resolve local music file path safely.
-
-    Supports exact path plus small filename mismatches.
-    """
+    """Resolve local music file path safely."""
     file_value = str(file_value or "").strip()
     track = track or {}
 
@@ -1790,7 +1783,6 @@ def resolve_audio_file_path(file_value, track=None):
             if candidate and os.path.exists(candidate):
                 return candidate
 
-    # Fallback: search music/ by filename, title, artist, search terms.
     return find_music_file_by_hint(
         file_value,
         track.get("title"),
@@ -1800,10 +1792,7 @@ def resolve_audio_file_path(file_value, track=None):
 
 
 def sniff_audio_mime(path):
-    """Detect MIME from file header, not only extension.
-
-    This helps when a downloaded .m4a/.webm file was renamed to .mp3.
-    """
+    """Detect MIME from file header, not only extension."""
     path = str(path or "")
     ext = os.path.splitext(path)[1].lower()
     try:
@@ -1836,46 +1825,45 @@ def sniff_audio_mime(path):
     return "audio/mpeg"
 
 
-def local_audio_bytes_and_mime(track):
+def audio_src_for_track(track):
+    """Return a browser-playable source for a local music file or preview URL."""
     track = track or {}
     local_file = resolve_audio_file_path(track.get("file"), track)
-    if not local_file or not os.path.exists(local_file):
-        return None, ""
-    try:
-        with open(local_file, "rb") as file:
-            data = file.read()
-    except Exception:
-        return None, ""
-    if not data:
-        return None, ""
-    return data, sniff_audio_mime(local_file)
+    if local_file and os.path.exists(local_file):
+        try:
+            with open(local_file, "rb") as audio_file:
+                encoded = base64.b64encode(audio_file.read()).decode("utf-8")
+            if encoded:
+                return f"data:{sniff_audio_mime(local_file)};base64,{encoded}"
+        except Exception:
+            return ""
 
-
-def audio_src_for_track(track):
-    """Return URL preview only. Local files are played with st.audio bytes."""
-    track = track or {}
     preview = str(track.get("preview_url") or "").strip()
     if preview.startswith(("http://", "https://", "data:")):
         return preview
     return ""
 
 
-def render_track_audio(track, autoplay=False, compact=False):
-    """Render an audio player that actually loads local files.
-
-    st.audio(bytes) is more reliable than a huge base64 data URL.
-    """
-    data, mime = local_audio_bytes_and_mime(track)
-    if data:
-        st.audio(data, format=mime)
-        return True
-
+def render_track_audio_html(track, autoplay=False, compact=False):
+    """Return HTML audio markup; use inside existing custom UI."""
     src = audio_src_for_track(track)
-    if src:
-        st.audio(src, format="audio/mp3")
-        return True
+    if not src:
+        st.session_state.music_notice = expected_music_debug_text()
+        return ""
+    autoplay_attr = " autoplay" if autoplay else ""
+    compact_class = " compact" if compact else ""
+    return f"""
+<div class="native-audio{compact_class}">
+  <audio controls{autoplay_attr} preload="auto" src="{escape(src, quote=True)}"></audio>
+</div>
+"""
 
-    st.session_state.music_notice = expected_music_debug_text()
+
+def render_track_audio(track, autoplay=False, compact=False):
+    markup = render_track_audio_html(track, autoplay=autoplay, compact=compact)
+    if markup:
+        html(markup)
+        return True
     return False
 
 
@@ -2984,25 +2972,15 @@ elif page == "home":
     playing_memory = next((memory for memory in music_memories if memory.get("id") == playing_id), None)
     if playing_memory:
         playing_track = playing_memory.get("selected_track") or {}
-        audio_src = playing_track.get("file") or playing_track.get("preview_url")
-        if audio_src:
+        if playing_track:
             home_audio_html = f"""
 <div class="home-now-playing">
   <div>{escape(playing_track.get("title") or "선택한 음악")}</div>
-  <audio controls autoplay src="{escape(audio_src, quote=True)}"></audio>
 </div>
 """
 
     if music_memories:
-        primary_memory = playing_memory or music_memories[0]
-        primary_track = primary_memory.get("selected_track") or {}
-        primary_cover_src = primary_track.get("image") or image_src(photo_path_for_memory(primary_memory))
-        primary_cover = (
-            f'<img src="{escape(primary_cover_src, quote=True)}" alt="">'
-            if primary_cover_src
-            else '<span>♪</span>'
-        )
-        track_rows = []
+        music_cards = []
         for memory in music_memories:
             memory_id_value = str(memory.get("id") or "")
             memory_id_query = quote(memory_id_value)
@@ -3015,30 +2993,28 @@ elif page == "home":
             )
             title = escape(track.get("title") or "노래 제목")
             artist = escape(track.get("artist") or "가수")
-            audio_source = track.get("file") or track.get("preview_url")
-            play_href = f"?action=home_music_play&memory={memory_id_query}" if audio_source else "#"
-            playing_class = " playing" if memory.get("id") == playing_id else ""
-            disabled_class = "" if audio_source else " disabled"
-            track_rows.append(f"""
-<div class="home-track-row{playing_class}">
-  <div class="home-track-cover">{cover_html}</div>
-  <div class="home-track-copy">
-    <div class="home-track-title">{title}</div>
-    <div class="home-track-artist">By {artist}</div>
+            audio_html = render_track_audio_html(track, autoplay=False, compact=False)
+            if not audio_html:
+                audio_html = '<div class="home-music-audio-missing">음원 파일을 찾지 못했어요.</div>'
+
+            music_cards.append(f"""
+<article class="home-music-card">
+  <div class="home-music-card-top">
+    <div class="home-music-cover">{cover_html}</div>
+    <div class="home-music-copy">
+      <div class="home-music-title">{title}</div>
+      <div class="home-music-artist">By {artist}</div>
+    </div>
   </div>
-  <div class="home-track-actions">
-    <a class="home-track-play{disabled_class}" href="{play_href}" target="_self" aria-label="재생">▶</a>
-    <a class="home-track-edit" href="?action=music_edit&memory={memory_id_query}" target="_self" aria-label="수정">✎</a>
-    <a class="home-track-delete" href="?action=music_delete&memory={memory_id_query}" target="_self" aria-label="삭제">삭제</a>
+  <div class="home-music-audio">{audio_html}</div>
+  <div class="home-music-actions">
+    <a class="home-music-edit" href="?action=music_edit&memory={memory_id_query}" target="_self">수정</a>
+    <a class="home-music-delete" href="?action=music_delete&memory={memory_id_query}" target="_self">삭제</a>
   </div>
-</div>
+</article>
 """)
-        music_content = f"""
-<div class="home-music-layout">
-  <div class="home-music-hero">{primary_cover}</div>
-  <div class="home-track-list">{"".join(track_rows)}{home_audio_html}</div>
-</div>
-"""
+
+        music_content = '<div class="home-music-strip">' + "".join(music_cards) + "</div>"
     else:
         music_content = '<div class="home-empty">아직 연결된 음악이 없어요.<br>기억을 기록하면서 음악을 골라보세요.</div>'
 
@@ -3253,138 +3229,121 @@ div[data-testid="stVerticalBlock"] {{ gap:0 !important; }}
 .home-album-card-empty {{
     background:rgba(255,255,255,.76);
 }}
-.home-music-layout {{
-    display:grid;
-    grid-template-columns:39% 1fr;
-    gap:62px;
-    align-items:center;
-    padding:0 54px 0 28px;
-}}
-.home-music-hero {{
-    width:190px;
-    height:190px;
-    justify-self:center;
-    border-radius:8px;
-    background:#eee;
-    overflow:hidden;
+.home-music-strip {{
     display:flex;
-    align-items:center;
-    justify-content:center;
-    color:#999;
-    font-size:40px;
-    box-shadow:0 16px 36px rgba(0,0,0,.06);
-}}
-.home-music-hero img {{
-    width:100%;
-    height:100%;
-    object-fit:cover;
-    display:block;
-}}
-.home-track-list {{
-    max-height:328px;
-    overflow-y:auto;
-    padding-right:6px;
+    gap:28px;
+    overflow-x:auto;
+    overflow-y:hidden;
+    padding:0 34px 16px 0;
+    scroll-snap-type:x proximity;
     scrollbar-width:none;
 }}
-.home-track-list::-webkit-scrollbar {{ display:none; }}
-.home-track-row {{
-    min-height:55px;
+.home-music-strip::-webkit-scrollbar {{ display:none; }}
+.home-music-card {{
+    flex:0 0 260px;
+    min-height:236px;
+    border-radius:16px;
+    background:#fff;
+    box-shadow:0 16px 32px rgba(0,0,0,.05);
+    padding:14px;
+    scroll-snap-align:start;
+}}
+.home-music-card-top {{
     display:grid;
-    grid-template-columns:48px 1fr 118px;
+    grid-template-columns:74px 1fr;
     gap:14px;
     align-items:center;
-    margin-bottom:12px;
+    min-height:78px;
 }}
-.home-track-cover {{
-    width:44px;
-    height:44px;
-    border-radius:3px;
-    background:#d9d9d9;
+.home-music-cover {{
+    width:74px;
+    height:74px;
+    border-radius:8px;
+    background:#ececec;
+    color:#999;
     overflow:hidden;
     display:flex;
     align-items:center;
     justify-content:center;
-    color:#888;
-    font-size:18px;
+    font-size:28px;
 }}
-.home-track-cover img {{
+.home-music-cover img {{
     width:100%;
     height:100%;
     object-fit:cover;
     display:block;
 }}
-.home-track-title {{
-    color:#111;
-    font-size:16px;
-    line-height:1.18;
+.home-music-copy {{
+    min-width:0;
+}}
+.home-music-title {{
+    color:#ff5b18;
+    font-size:17px;
+    line-height:1.15;
+    font-weight:1000;
+    white-space:nowrap;
+    overflow:hidden;
+    text-overflow:ellipsis;
+}}
+.home-music-artist {{
+    margin-top:8px;
+    color:#777;
+    font-size:12px;
+    line-height:1.1;
     font-weight:800;
     white-space:nowrap;
     overflow:hidden;
     text-overflow:ellipsis;
 }}
-.home-track-row.playing .home-track-title {{
-    color:#ff5b18;
-}}
-.home-track-artist {{
-    margin-top:5px;
-    color:#888;
-    font-size:12px;
-    line-height:1.1;
-    white-space:nowrap;
+.home-music-audio {{
+    margin-top:18px;
+    height:42px;
+    border-radius:999px;
+    background:#f0f0f0;
     overflow:hidden;
-    text-overflow:ellipsis;
-}}
-.home-track-actions {{
     display:flex;
     align-items:center;
-    justify-content:flex-end;
+    padding:0 8px;
+}}
+.home-music-audio .native-audio {{
+    width:100%;
+    height:34px;
+}}
+.home-music-audio .native-audio audio {{
+    width:100%;
+    height:34px;
+    display:block;
+}}
+.home-music-audio-missing {{
+    color:#888;
+    font-size:11px;
+    font-weight:800;
+    width:100%;
+    text-align:center;
+}}
+.home-music-actions {{
+    margin-top:20px;
+    display:grid;
+    grid-template-columns:1fr 1fr;
     gap:10px;
 }}
-.home-track-play {{
-    color:#ff5b18;
-    font-size:26px;
-    line-height:1;
-    font-weight:900;
-}}
-.home-track-play.disabled {{
-    opacity:.28;
-    pointer-events:none;
-}}
-.home-track-edit,
-.home-track-delete {{
-    min-width:32px;
-    height:28px;
-    border-radius:999px;
-    background:#fff;
-    box-shadow:0 8px 16px rgba(0,0,0,.07);
+.home-music-actions a {{
+    height:38px;
+    border-radius:12px;
     display:flex;
     align-items:center;
     justify-content:center;
-    color:#333;
-    font-size:12px;
-    font-weight:900;
+    text-decoration:none !important;
+    font-size:13px;
+    font-weight:1000;
 }}
-.home-track-edit {{
-    font-size:18px;
+.home-music-edit {{
+    background:#111;
+    color:#fff !important;
 }}
-.home-track-delete {{
-    color:#cf4b38;
-    padding:0 10px;
-}}
-.home-now-playing {{
-    margin-top:12px;
-    padding:12px 14px;
-    border-radius:14px;
-    background:rgba(255,255,255,.78);
-    box-shadow:0 10px 22px rgba(0,0,0,.055);
-    color:#444;
-    font-size:12px;
-    font-weight:800;
-}}
-.home-now-playing audio {{
-    width:100%;
-    height:34px;
-    margin-top:8px;
+.home-music-delete {{
+    background:#f4f4f4;
+    color:#cf4b38 !important;
 }}
 .home-empty {{
     min-height:300px;
@@ -3446,28 +3405,11 @@ div[data-testid="stVerticalBlock"] {{ gap:0 !important; }}
     .home-card-photo {{
         height:145px;
     }}
-    .home-music-layout {{
-        grid-template-columns:36% 1fr;
-        gap:52px;
-        padding:0 36px 0 28px;
+    .home-music-card {{
+        flex-basis:250px;
     }}
-    .home-music-hero {{
-        width:178px;
-        height:178px;
-    }}
-    .home-track-row {{
-        grid-template-columns:36px 1fr 90px;
-        gap:10px;
-    }}
-    .home-track-cover {{
-        width:34px;
-        height:34px;
-    }}
-    .home-track-title {{
-        font-size:13px;
-    }}
-    .home-track-artist {{
-        font-size:10px;
+    .home-music-strip {{
+        gap:24px;
     }}
     .home-footer-actions {{
         margin:38px 10px 0 10px;
@@ -4203,9 +4145,8 @@ div[data-testid="stVerticalBlock"] {{ gap:.55rem !important; }}
   <div class="home-music-link">{linked_title}</div>
 </div>
 """)
-                    audio_source = track.get("file") or track.get("preview_url")
-                    if audio_source:
-                        st.audio(audio_source)
+                    if not render_track_audio(track):
+                        html('<div style="font-size:11px;color:#777;font-weight:800;margin-top:6px;">음원 파일을 찾지 못했어요.</div>')
                     edit_col, delete_col = st.columns(2)
                     with edit_col:
                         if st.button("수정", key=f"home_music_edit_{index}", use_container_width=True):
@@ -6057,13 +5998,31 @@ div[data-testid="column"] {
     overflow:hidden;
 }
 div[data-testid="stAudio"] {
-    display:block !important;
-    width:420px !important;
-    margin-top:10px !important;
+    display:none !important;
 }
-div[data-testid="stAudio"] audio {
-    width:420px !important;
-    height:34px !important;
+.native-audio {
+    width:100%;
+    height:36px;
+    display:flex;
+    align-items:center;
+}
+.native-audio audio {
+    width:100%;
+    height:34px;
+    display:block;
+}
+.native-audio.compact {
+    position:absolute;
+    left:30px;
+    bottom:24px;
+    width:360px;
+    height:34px;
+    z-index:20;
+    opacity:.78;
+}
+.native-audio.compact audio {
+    width:360px;
+    height:34px;
 }
 
 .music-right-title {
@@ -6233,18 +6192,10 @@ div[data-testid="stAudio"] audio {
   </div>
   <div class="music-card-progress"><span></span></div>
   <div class="music-player-controls">
-    <div>◀</div>
-    <div class="music-play-circle">Ⅱ</div>
-    <div>▶</div>
-    <div></div>
-    <div>⤨</div>
-    <div>↻</div>
+    {render_track_audio_html(selected_track, autoplay=False, compact=False) or '<div style="color:#777;font-size:12px;font-weight:800;">음원 파일을 찾지 못했어요.</div>'}
   </div>
 </div>
 """)
-            if not render_track_audio(selected_track, autoplay=False, compact=False):
-                debug_msg = escape(st.session_state.get("music_notice") or "music 폴더 파일명을 확인해주세요.")
-                html(f'<div style="width:420px;margin-top:10px;color:#777;font-size:12px;font-weight:800;">음원 파일을 찾지 못했어요. {debug_msg}</div>')
         else:
             html("""
 <div class="music-empty-card">
@@ -6535,6 +6486,7 @@ elif page == "play_fullscreen":
         if current_caption
         else ""
     )
+    play_audio_html = render_track_audio_html(current_track, autoplay=True, compact=True)
     exit_href = "?action=playback_exit"
 
     html(f"""
@@ -6647,16 +6599,20 @@ div[data-testid="stVerticalBlock"] {{
     flex:0 0 auto;
 }}
 div[data-testid="stAudio"] {{
-    position:absolute !important;
-    left:30px !important;
-    bottom:24px !important;
-    width:360px !important;
-    z-index:20 !important;
-    opacity:.72 !important;
+    display:none !important;
 }}
-div[data-testid="stAudio"] audio {{
-    width:360px !important;
-    height:34px !important;
+.native-audio.compact {{
+    position:absolute;
+    left:30px;
+    bottom:24px;
+    width:360px;
+    height:34px;
+    z-index:20;
+    opacity:.78;
+}}
+.native-audio.compact audio {{
+    width:360px;
+    height:34px;
 }}
 </style>
 <div class="play-fullscreen">
@@ -6666,12 +6622,9 @@ div[data-testid="stAudio"] audio {{
     {caption_html}
   </div>
   <a class="play-exit-link" href="{exit_href}" target="_self">종료</a>
+  {play_audio_html}
 </div>
 """)
-
-    # 브라우저 정책 때문에 자동 재생이 막힐 수 있어서 컨트롤도 함께 표시한다.
-    # 추억재생하기 버튼을 누른 직후라 일부 환경에서는 autoplay가 동작한다.
-    render_track_audio(current_track, autoplay=True, compact=True)
 
     time.sleep(0.4)
     st.rerun()
