@@ -798,14 +798,11 @@ def sync_answer_to_memory_text():
     answers = ensure_question_answers()
     questions = st.session_state.get("questions") or []
     lines = []
-    for index, question in enumerate(questions[:3]):
+    for index, _question in enumerate(questions[:3]):
         answer = str(answers.get(str(index), "")).strip()
         if answer:
-            question_text = str(question or "").strip()
-            if question_text:
-                lines.append(f"Q{index + 1}. {question_text}\n{answer}")
-            else:
-                lines.append(answer)
+            # 홈 카드/재생 자막에는 질문 문구 없이 사용자가 기록한 답변만 저장한다.
+            lines.append(answer)
     st.session_state.memory_text = "\n\n".join(lines).strip()
     return st.session_state.memory_text
 
@@ -869,7 +866,7 @@ def update_existing_memory_from_write(memory_id):
     sync_answer_to_memory_text()
     note_text = st.session_state.get("memory_text", "").strip()
     if not note_text:
-        note_text = memory_question_answer_text(memory, include_questions=True)
+        note_text = memory_question_answer_text(memory, include_questions=False)
     memory["note"] = note_text
     if handwriting:
         memory["handwriting"] = handwriting
@@ -997,7 +994,7 @@ def save_memory(include_summary=True):
             "questions": st.session_state.get("questions") or [],
             "question_answers": ensure_question_answers(),
         }
-        note_text = memory_question_answer_text(temp_memory_for_note, include_questions=True)
+        note_text = memory_question_answer_text(temp_memory_for_note, include_questions=False)
 
     data = {
         "id": st.session_state.memory_id,
@@ -1048,7 +1045,8 @@ def load_memories():
             memory["nfc_category"] = memory["nfc_label"]
         if media_reference_available(memory.get("photo")):
             memories.append(memory)
-    memories.sort(key=lambda item: item.get("time", ""), reverse=True)
+    # 처음 기록한 사진이 맨 앞에 오도록 오래된 순서로 정렬
+    memories.sort(key=lambda item: item.get("time", ""))
     return memories
 
 
@@ -1085,14 +1083,13 @@ def memory_title(memory):
 
 
 def memory_question_answer_text(memory, include_questions=False):
-    """Return text recorded through the 3 question flow.
+    """Return only user-recorded answers from the 3 question flow.
 
-    Some records have answers saved in question_answers but note is empty.
-    This makes home cards, edit pages, and playback subtitles still show them.
+    질문 문구(Q1. ...)는 홈 카드/자막/미리보기에는 보이지 않게 하고,
+    사용자가 실제로 기록한 답변 문장만 반환한다.
     """
     memory = memory or {}
     answers = memory.get("question_answers") or memory.get("answers")
-    questions = memory.get("questions") or []
 
     lines = []
     if isinstance(answers, dict):
@@ -1103,43 +1100,46 @@ def memory_question_answer_text(memory, include_questions=False):
             except Exception:
                 return 999
 
-        for key, answer in sorted(answers.items(), key=answer_sort_key):
+        for _key, answer in sorted(answers.items(), key=answer_sort_key):
             answer_text = str(answer or "").strip()
-            if not answer_text:
-                continue
-            if include_questions:
-                try:
-                    q_index = int(key)
-                except Exception:
-                    q_index = len(lines)
-                question = str(questions[q_index] if q_index < len(questions) else "").strip()
-                if question:
-                    lines.append(f"Q{q_index + 1}. {question}\n{answer_text}")
-                else:
-                    lines.append(answer_text)
-            else:
+            if answer_text:
                 lines.append(answer_text)
 
     elif isinstance(answers, list):
-        for index, answer in enumerate(answers):
+        for answer in answers:
             answer_text = str(answer or "").strip()
-            if not answer_text:
-                continue
-            if include_questions:
-                question = str(questions[index] if index < len(questions) else "").strip()
-                lines.append(f"Q{index + 1}. {question}\n{answer_text}" if question else answer_text)
-            else:
+            if answer_text:
                 lines.append(answer_text)
 
-    return "\n\n".join(lines).strip()
+    return "\\n\\n".join(lines).strip()
+
+
+def strip_question_labels_from_note(note):
+    """Remove Q1 question lines from old saved notes and keep recorded answers."""
+    raw = str(note or "").strip()
+    if not raw:
+        return ""
+
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    kept = []
+    skip_next_question_line = False
+
+    for line in lines:
+        # Drop lines like "Q1. 이 사진을 찍던 날은 어떤 날이었나요?"
+        if re.match(r"^Q\s*\d+\s*[\.)]\s*", line):
+            continue
+        kept.append(line)
+
+    cleaned = "\n".join(kept).strip()
+    return cleaned
 
 
 def memory_record_text(memory, include_questions=False):
-    """Prefer note, but fall back to the 3 question answers."""
-    note = str((memory or {}).get("note") or "").strip()
+    """Prefer note, but remove Q question labels; fall back to recorded answers."""
+    note = strip_question_labels_from_note((memory or {}).get("note") or "")
     if note:
         return note
-    return memory_question_answer_text(memory, include_questions=include_questions)
+    return memory_question_answer_text(memory, include_questions=False)
 
 
 def memory_note_preview(memory, limit=32):
