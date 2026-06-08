@@ -3232,6 +3232,22 @@ div[data-testid="stVerticalBlock"] {{ gap:0 !important; }}
         font-size:18px;
     }}
 }}
+
+/* home screen: hide side scrollbar only */
+html, body, .stApp,
+.stApp [data-testid="stAppViewContainer"],
+.stApp [data-testid="stMain"],
+.stApp [data-testid="stMainBlockContainer"] {
+    overflow:hidden !important;
+}
+*::-webkit-scrollbar {
+    display:none !important;
+    width:0 !important;
+    height:0 !important;
+}
+* {
+    scrollbar-width:none !important;
+}
 </style>
 <div class="home-header">
   <div class="home-logo">{HOME_LOGO_HTML}</div>
