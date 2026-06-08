@@ -1592,12 +1592,10 @@ def local_music_tracks(query=""):
         title = str(track.get("title") or "")
         artist = str(track.get("artist") or "")
         file_path = str(track.get("file") or "")
-        absolute_file = os.path.join(BASE, file_path)
-
-        # Show the track even if the file is missing, but keep file path only when it exists.
         item = dict(track)
-        if not os.path.exists(absolute_file):
-            item["file"] = ""
+        resolved_file = resolve_audio_file_path(file_path, item)
+        if resolved_file:
+            item["file"] = resolved_file
 
         search_terms = str(track.get("search_terms") or "")
         haystack = f"{title} {artist} {file_path} {search_terms}".lower()
@@ -1710,29 +1708,95 @@ def normalize_track(track):
 
 
 
-def resolve_audio_file_path(file_value):
+
+def normalize_filename_key(value):
+    return re.sub(r"[^a-z0-9가-힣]+", "", str(value or "").lower())
+
+
+def list_music_files():
+    try:
+        return [
+            name for name in os.listdir(MUSIC_DIR)
+            if os.path.isfile(os.path.join(MUSIC_DIR, name))
+        ]
+    except Exception:
+        return []
+
+
+def find_music_file_by_hint(*hints):
+    """Find an audio file in music/ even if the filename is slightly different."""
+    files = list_music_files()
+    if not files:
+        return ""
+
+    audio_exts = (".mp3", ".m4a", ".mp4", ".aac", ".wav", ".ogg", ".webm")
+    files = [name for name in files if name.lower().endswith(audio_exts)]
+    if not files:
+        return ""
+
+    hint_values = [str(hint or "").strip() for hint in hints if str(hint or "").strip()]
+    hint_basenames = [os.path.basename(hint) for hint in hint_values]
+    hint_keys = [normalize_filename_key(os.path.splitext(hint)[0]) for hint in hint_basenames + hint_values]
+
+    # 1) exact basename match
+    for hint in hint_basenames:
+        for name in files:
+            if name == hint:
+                return os.path.join(MUSIC_DIR, name)
+
+    # 2) case-insensitive exact basename
+    lower_to_name = {name.lower(): name for name in files}
+    for hint in hint_basenames:
+        picked = lower_to_name.get(hint.lower())
+        if picked:
+            return os.path.join(MUSIC_DIR, picked)
+
+    # 3) normalized stem contains/matches
+    for name in files:
+        name_key = normalize_filename_key(os.path.splitext(name)[0])
+        for hint_key in hint_keys:
+            if hint_key and (hint_key in name_key or name_key in hint_key):
+                return os.path.join(MUSIC_DIR, name)
+
+    return ""
+
+
+def expected_music_debug_text():
+    files = list_music_files()
+    if not files:
+        return "music 폴더가 비어 있거나, 배포된 서버에 music 파일이 없습니다."
+    return "music 폴더 파일: " + ", ".join(files[:8])
+
+
+def resolve_audio_file_path(file_value, track=None):
     """Resolve local music file path safely.
 
-    Supports:
-    - music/my_way_yoon_taegyu.mp3
-    - absolute paths
+    Supports exact path plus small filename mismatches.
     """
     file_value = str(file_value or "").strip()
-    if not file_value:
-        return ""
+    track = track or {}
+
     if file_value.startswith(("http://", "https://", "data:")):
         return file_value
 
-    normalized = file_value.replace("/", os.sep).replace("\\", os.sep)
-    candidates = [
-        normalized,
-        os.path.join(BASE, normalized),
-        os.path.join(MUSIC_DIR, os.path.basename(normalized)),
-    ]
-    for candidate in candidates:
-        if candidate and os.path.exists(candidate):
-            return candidate
-    return ""
+    if file_value:
+        normalized = file_value.replace("/", os.sep).replace("\\", os.sep)
+        candidates = [
+            normalized,
+            os.path.join(BASE, normalized),
+            os.path.join(MUSIC_DIR, os.path.basename(normalized)),
+        ]
+        for candidate in candidates:
+            if candidate and os.path.exists(candidate):
+                return candidate
+
+    # Fallback: search music/ by filename, title, artist, search terms.
+    return find_music_file_by_hint(
+        file_value,
+        track.get("title"),
+        track.get("artist"),
+        track.get("search_terms"),
+    )
 
 
 def sniff_audio_mime(path):
@@ -1774,7 +1838,7 @@ def sniff_audio_mime(path):
 
 def local_audio_bytes_and_mime(track):
     track = track or {}
-    local_file = resolve_audio_file_path(track.get("file"))
+    local_file = resolve_audio_file_path(track.get("file"), track)
     if not local_file or not os.path.exists(local_file):
         return None, ""
     try:
@@ -1811,6 +1875,7 @@ def render_track_audio(track, autoplay=False, compact=False):
         st.audio(src, format="audio/mp3")
         return True
 
+    st.session_state.music_notice = expected_music_debug_text()
     return False
 
 
@@ -6178,7 +6243,8 @@ div[data-testid="stAudio"] audio {
 </div>
 """)
             if not render_track_audio(selected_track, autoplay=False, compact=False):
-                html('<div style="width:420px;margin-top:10px;color:#777;font-size:12px;font-weight:800;">음원 파일을 찾지 못했어요. music 폴더 파일명을 확인해주세요.</div>')
+                debug_msg = escape(st.session_state.get("music_notice") or "music 폴더 파일명을 확인해주세요.")
+                html(f'<div style="width:420px;margin-top:10px;color:#777;font-size:12px;font-weight:800;">음원 파일을 찾지 못했어요. {debug_msg}</div>')
         else:
             html("""
 <div class="music-empty-card">
