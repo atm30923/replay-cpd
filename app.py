@@ -19,9 +19,11 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 PHOTO_DIR = os.path.join(BASE, "photos")
 MEMORY_DIR = os.path.join(BASE, "memories")
 HANDWRITING_DIR = os.path.join(BASE, "handwriting")
+MUSIC_DIR = os.path.join(BASE, "music")
 os.makedirs(PHOTO_DIR, exist_ok=True)
 os.makedirs(MEMORY_DIR, exist_ok=True)
 os.makedirs(HANDWRITING_DIR, exist_ok=True)
+os.makedirs(MUSIC_DIR, exist_ok=True)
 load_dotenv()
 
 SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
@@ -1554,8 +1556,77 @@ def get_spotify_token():
     return response.json()["access_token"]
 
 
+
+LOCAL_MUSIC_TRACKS = [
+    {
+        "title": "마이웨이",
+        "artist": "윤태규",
+        "image": "",
+        "preview_url": "",
+        "file": os.path.join("music", "my_way_yoon_taegyu.mp3"),
+        "source": "local",
+        "search_terms": "마이웨이 윤태규 my way",
+    },
+    {
+        "title": "하숙생",
+        "artist": "최희준",
+        "image": "",
+        "preview_url": "",
+        "file": os.path.join("music", "life_is_traveler.mp3"),
+        "source": "local",
+        "search_terms": "인생은 나그네길 어디서 왔다가 어디로 가는가 하숙생 최희준",
+    },
+]
+
+
+def local_music_tracks(query=""):
+    """Return local mp3 tracks bundled in the project.
+
+    Put files in:
+    music/my_way_yoon_taegyu.mp3
+    music/life_is_traveler.mp3
+    """
+    query_text = str(query or "").strip().lower()
+    tracks = []
+    for track in LOCAL_MUSIC_TRACKS:
+        title = str(track.get("title") or "")
+        artist = str(track.get("artist") or "")
+        file_path = str(track.get("file") or "")
+        absolute_file = os.path.join(BASE, file_path)
+
+        # Show the track even if the file is missing, but keep file path only when it exists.
+        item = dict(track)
+        if not os.path.exists(absolute_file):
+            item["file"] = ""
+
+        search_terms = str(track.get("search_terms") or "")
+        haystack = f"{title} {artist} {file_path} {search_terms}".lower()
+        if query_text and query_text not in haystack:
+            continue
+        tracks.append(item)
+    return tracks
+
+
+def merge_unique_tracks(*track_groups):
+    merged = []
+    seen = set()
+    for group in track_groups:
+        for track in group or []:
+            normalized_title = str(track.get("title") or "").strip().lower()
+            normalized_artist = str(track.get("artist") or "").strip().lower()
+            key = (normalized_title, normalized_artist)
+            if not normalized_title or key in seen:
+                continue
+            seen.add(key)
+            merged.append(track)
+    return merged
+
+
 def spotify_recommendations(query="korean old pop memories"):
     query_text = str(query or "").lower()
+    local_tracks_for_query = local_music_tracks(query)
+    if not local_tracks_for_query and query_text in ("", "korean old pop memories"):
+        local_tracks_for_query = local_music_tracks("")
     if any(word in query_text for word in ("birthday", "생일", "party", "축하", "cake")):
         fallback = [
             {"title": "Happy Birthday To You", "artist": "Birthday Memory", "image": "", "preview_url": ""},
@@ -1587,7 +1658,7 @@ def spotify_recommendations(query="korean old pop memories"):
     try:
         token = get_spotify_token()
         if not token:
-            return fallback
+            return merge_unique_tracks(local_tracks_for_query, fallback)
         response = requests.get(
             "https://api.spotify.com/v1/search",
             headers={"Authorization": f"Bearer {token}"},
@@ -1606,9 +1677,9 @@ def spotify_recommendations(query="korean old pop memories"):
                     "preview_url": item.get("preview_url") or "",
                 }
             )
-        return tracks or fallback
+        return merge_unique_tracks(local_tracks_for_query, tracks or fallback)
     except Exception:
-        return fallback
+        return merge_unique_tracks(local_tracks_for_query, fallback)
 
 
 DEFAULT_TRACK_LYRICS = [
@@ -1629,9 +1700,118 @@ def normalize_track(track):
         "artist": str(track.get("artist") or "가수").strip(),
         "image": str(track.get("image") or "").strip(),
         "preview_url": str(track.get("preview_url") or "").strip(),
+        "file": str(track.get("file") or "").strip(),
+        "source": str(track.get("source") or "").strip(),
+        "search_terms": str(track.get("search_terms") or "").strip(),
         "lyrics": [str(line) for line in lyrics if str(line).strip()],
     }
 
+
+
+
+
+def resolve_audio_file_path(file_value):
+    """Resolve local music file path safely.
+
+    Supports:
+    - music/my_way_yoon_taegyu.mp3
+    - absolute paths
+    """
+    file_value = str(file_value or "").strip()
+    if not file_value:
+        return ""
+    if file_value.startswith(("http://", "https://", "data:")):
+        return file_value
+
+    normalized = file_value.replace("/", os.sep).replace("\\", os.sep)
+    candidates = [
+        normalized,
+        os.path.join(BASE, normalized),
+        os.path.join(MUSIC_DIR, os.path.basename(normalized)),
+    ]
+    for candidate in candidates:
+        if candidate and os.path.exists(candidate):
+            return candidate
+    return ""
+
+
+def sniff_audio_mime(path):
+    """Detect MIME from file header, not only extension.
+
+    This helps when a downloaded .m4a/.webm file was renamed to .mp3.
+    """
+    path = str(path or "")
+    ext = os.path.splitext(path)[1].lower()
+    try:
+        with open(path, "rb") as file:
+            head = file.read(32)
+    except Exception:
+        head = b""
+
+    if head.startswith(b"ID3") or head[:2] in (b"\xff\xfb", b"\xff\xf3", b"\xff\xf2"):
+        return "audio/mpeg"
+    if b"ftyp" in head[:16]:
+        return "audio/mp4"
+    if head.startswith(b"RIFF") and b"WAVE" in head[:16]:
+        return "audio/wav"
+    if head.startswith(b"OggS"):
+        return "audio/ogg"
+    if head.startswith(b"\x1a\x45\xdf\xa3"):
+        return "audio/webm"
+
+    if ext == ".mp3":
+        return "audio/mpeg"
+    if ext in (".m4a", ".mp4", ".aac"):
+        return "audio/mp4"
+    if ext == ".wav":
+        return "audio/wav"
+    if ext == ".ogg":
+        return "audio/ogg"
+    if ext == ".webm":
+        return "audio/webm"
+    return "audio/mpeg"
+
+
+def local_audio_bytes_and_mime(track):
+    track = track or {}
+    local_file = resolve_audio_file_path(track.get("file"))
+    if not local_file or not os.path.exists(local_file):
+        return None, ""
+    try:
+        with open(local_file, "rb") as file:
+            data = file.read()
+    except Exception:
+        return None, ""
+    if not data:
+        return None, ""
+    return data, sniff_audio_mime(local_file)
+
+
+def audio_src_for_track(track):
+    """Return URL preview only. Local files are played with st.audio bytes."""
+    track = track or {}
+    preview = str(track.get("preview_url") or "").strip()
+    if preview.startswith(("http://", "https://", "data:")):
+        return preview
+    return ""
+
+
+def render_track_audio(track, autoplay=False, compact=False):
+    """Render an audio player that actually loads local files.
+
+    st.audio(bytes) is more reliable than a huge base64 data URL.
+    """
+    data, mime = local_audio_bytes_and_mime(track)
+    if data:
+        st.audio(data, format=mime)
+        return True
+
+    src = audio_src_for_track(track)
+    if src:
+        st.audio(src, format="audio/mp3")
+        return True
+
+    return False
 
 
 def get_lyrics_from_lrclib(title, artist):
@@ -1689,6 +1869,7 @@ def filtered_music_tracks(tracks, query):
         for track in normalized
         if search in track.get("title", "").lower()
         or search in track.get("artist", "").lower()
+        or search in track.get("search_terms", "").lower()
     ]
 
 
@@ -5811,7 +5992,13 @@ div[data-testid="column"] {
     overflow:hidden;
 }
 div[data-testid="stAudio"] {
-    display:none !important;
+    display:block !important;
+    width:420px !important;
+    margin-top:10px !important;
+}
+div[data-testid="stAudio"] audio {
+    width:420px !important;
+    height:34px !important;
 }
 
 .music-right-title {
@@ -5990,8 +6177,8 @@ div[data-testid="stAudio"] {
   </div>
 </div>
 """)
-            if selected_track.get("preview_url"):
-                st.audio(selected_track["preview_url"], format="audio/mp3")
+            if not render_track_audio(selected_track, autoplay=False, compact=False):
+                html('<div style="width:420px;margin-top:10px;color:#777;font-size:12px;font-weight:800;">음원 파일을 찾지 못했어요. music 폴더 파일명을 확인해주세요.</div>')
         else:
             html("""
 <div class="music-empty-card">
@@ -6058,10 +6245,12 @@ div[data-testid="stAudio"] {
             with row_cols[2]:
                 if st.button("✓" if is_selected else "+", key=f"music_select_track_{index}", use_container_width=True):
                     selected = normalized_music_track(track)
-                    selected["lyrics"] = get_lyrics_from_lrclib(
+                    found_lyrics = get_lyrics_from_lrclib(
                         selected.get("title", ""),
                         selected.get("artist", ""),
                     )
+                    if found_lyrics:
+                        selected["lyrics"] = found_lyrics
                     st.session_state.selected_track = selected
                     st.session_state.music_notice = ""
                     st.rerun()
@@ -6085,10 +6274,12 @@ div[data-testid="stAudio"] {
                 st.rerun()
             st.session_state.selected_track = normalized_music_track(st.session_state.selected_track)
             if not st.session_state.selected_track.get("lyrics") or st.session_state.selected_track.get("lyrics") == DEFAULT_TRACK_LYRICS:
-                st.session_state.selected_track["lyrics"] = get_lyrics_from_lrclib(
+                found_lyrics = get_lyrics_from_lrclib(
                     st.session_state.selected_track.get("title", ""),
                     st.session_state.selected_track.get("artist", ""),
                 )
+                if found_lyrics:
+                    st.session_state.selected_track["lyrics"] = found_lyrics
             edit_memory_id = st.session_state.get("editing_memory_id")
             if edit_memory_id and st.session_state.get("edit_mode") == "music_edit":
                 if update_memory_track(edit_memory_id, st.session_state.selected_track):
@@ -6395,7 +6586,11 @@ div[data-testid="stAudio"] {{
     bottom:24px !important;
     width:360px !important;
     z-index:20 !important;
-    opacity:.22 !important;
+    opacity:.72 !important;
+}}
+div[data-testid="stAudio"] audio {{
+    width:360px !important;
+    height:34px !important;
 }}
 </style>
 <div class="play-fullscreen">
@@ -6408,9 +6603,9 @@ div[data-testid="stAudio"] {{
 </div>
 """)
 
-    audio_src = (current_track or {}).get("file") or (current_track or {}).get("preview_url") or ""
-    if audio_src:
-        st.audio(audio_src, format="audio/mp3")
+    # 브라우저 정책 때문에 자동 재생이 막힐 수 있어서 컨트롤도 함께 표시한다.
+    # 추억재생하기 버튼을 누른 직후라 일부 환경에서는 autoplay가 동작한다.
+    render_track_audio(current_track, autoplay=True, compact=True)
 
     time.sleep(0.4)
     st.rerun()
