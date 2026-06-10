@@ -136,6 +136,8 @@ DEFAULTS = {
     "music_last_search_query": "",
     "music_show_more": False,
     "music_recommend_signature": "",
+    "music_search_plan": [],
+    "music_plan_token": "",
     "ai_music_query_cache": {},
     "play_memory": None,
     "selected_memory_id": None,
@@ -312,6 +314,8 @@ def reset_flow():
     st.session_state.music_last_search_query = ""
     st.session_state.music_show_more = False
     st.session_state.music_recommend_signature = ""
+    st.session_state.music_search_plan = []
+    st.session_state.music_plan_token = ""
     st.session_state.ai_music_query_cache = {}
     st.session_state.play_memory = None
     st.session_state.album_category = ""
@@ -372,6 +376,8 @@ def reset_scan_inputs():
     st.session_state.music_last_search_query = ""
     st.session_state.music_show_more = False
     st.session_state.music_recommend_signature = ""
+    st.session_state.music_search_plan = []
+    st.session_state.music_plan_token = ""
     st.session_state.ai_music_query_cache = {}
     st.session_state.memory_text = ""
     st.session_state.analysis_done = False
@@ -480,6 +486,8 @@ def save_photo(file):
     st.session_state.music_search_results = []
     st.session_state.music_last_search_query = ""
     st.session_state.music_recommend_signature = ""
+    st.session_state.music_search_plan = []
+    st.session_state.music_plan_token = ""
     st.session_state.music_show_more = False
     st.session_state.question_random_salt = str(uuid.uuid4())[:8]
     st.session_state.music_random_salt = str(uuid.uuid4())[:8]
@@ -2154,208 +2162,179 @@ def shuffle_tracks_for_memory(tracks, seed_text):
 
 
 
+RANDOM_KOREAN_MUSIC_POOL = [
+    "바람이 불어오는 곳 김광석", "옛사랑 이문세", "사랑했지만 김광석", "그리움만 쌓이네 여진",
+    "사랑으로 해바라기", "내 마음의 보석상자 해바라기", "걱정말아요 그대 전인권", "Bravo My Life 봄여름가을겨울",
+    "젊은 그대 김수철", "아름다운 강산 이선희", "일어나 김광석", "서른 즈음에 김광석",
+    "여행을 떠나요 조용필", "제주도의 푸른 밤 최성원", "남행열차 김수희", "고향역 나훈아",
+    "머나먼 고향 나훈아", "타향살이 고복수", "꿈에 본 내 고향", "찔레꽃 백난아",
+    "친구여 조용필", "친구 안재욱", "청춘 산울림", "이젠 안녕 015B",
+    "내 사랑 내 곁에 김현식", "사랑하기 때문에 유재하", "그대 그리고 나 소리새", "님과 함께 남진",
+    "잊혀진 계절 이용", "가을 편지 최양숙", "가을 우체국 앞에서 윤도현", "너무 아픈 사랑은 사랑이 아니었음을 김광석",
+    "인연 이선희", "가족사진 김진호", "엄마 라디", "아버지 싸이",
+    "엄마가 딸에게 양희은", "부모 유주용", "당신은 사랑받기 위해 태어난 사람", "생일 가람과 뫼",
+]
+
+
+def current_music_context(memory=None):
+    """Return context from the current photo/memory only."""
+    memory = memory or {}
+    current_id = str(st.session_state.get("memory_id") or st.session_state.get("selected_memory_id") or "")
+    memory_id = str(memory.get("id") or "")
+    same_memory = (not memory_id) or (not current_id) or memory_id == current_id
+
+    if same_memory:
+        note = recorded_text_for_music(memory)
+        questions = memory.get("questions") or st.session_state.get("questions") or []
+        answers = memory.get("question_answers") or st.session_state.get("question_answers") or {}
+        keywords = memory.get("keywords") or st.session_state.get("keywords") or []
+        label = str(memory.get("analysis_label") or st.session_state.get("analysis_label") or "").strip()
+        music_query = str(memory.get("music_query") or st.session_state.get("music_query") or "").strip()
+        photo_path = photo_path_for_memory(memory) or st.session_state.get("photo_path")
+    else:
+        note = str(st.session_state.get("memory_text") or "").strip()
+        questions = st.session_state.get("questions") or []
+        answers = st.session_state.get("question_answers") or {}
+        keywords = st.session_state.get("keywords") or []
+        label = str(st.session_state.get("analysis_label") or "").strip()
+        music_query = str(st.session_state.get("music_query") or "").strip()
+        photo_path = st.session_state.get("photo_path")
+
+    if isinstance(answers, dict):
+        answer_text = " ".join(str(v).strip() for _, v in sorted(answers.items()) if str(v).strip())
+    elif isinstance(answers, list):
+        answer_text = " ".join(str(v).strip() for v in answers if str(v).strip())
+    else:
+        answer_text = ""
+
+    return {
+        "memory_id": current_id or memory_id,
+        "photo_path": photo_path,
+        "label": label,
+        "keywords": [str(k).strip() for k in keywords if str(k).strip()],
+        "questions": [str(q).strip() for q in questions if str(q).strip()],
+        "answers": answer_text,
+        "note": note,
+        "music_query": music_query,
+    }
+
+
+def music_context_seed(context=None):
+    context = context or {}
+    source = "|".join([
+        str(st.session_state.get("music_random_salt") or ""),
+        str(context.get("memory_id") or ""),
+        str(context.get("photo_path") or ""),
+        str(context.get("label") or ""),
+        " ".join(context.get("keywords") or []),
+        str(context.get("answers") or ""),
+        str(context.get("note") or ""),
+    ])
+    return hashlib.sha256(source.encode("utf-8")).hexdigest()
+
+
+def random_music_queries(context=None, count=10):
+    seed = music_context_seed(context)
+    return stable_shuffle(RANDOM_KOREAN_MUSIC_POOL, "random_pool|" + seed)[:count]
+
+
+def clean_music_queries(values):
+    cleaned = []
+    for value in values or []:
+        q = str(value or "").strip()
+        q = re.sub(r"\s+", " ", q)
+        if not q:
+            continue
+        if q.lower() in ("none", "null", "없음"):
+            continue
+        if q not in cleaned:
+            cleaned.append(q)
+    return cleaned[:14]
+
+
+def ai_music_search_queries(memory=None):
+    """Ask Gemini for actual song search candidates for the current photo/record."""
+    context = current_music_context(memory)
+    seed = music_context_seed(context)
+
+    if not GEMINI_API_KEY:
+        queries = random_music_queries(context, count=10)
+        st.session_state["last_ai_music_query"] = " / ".join(queries[:3])
+        return queries
+
+    label = context.get("label") or ""
+    keywords = ", ".join(context.get("keywords") or [])
+    questions = " / ".join(context.get("questions")[:3] or [])
+    answers = context.get("answers") or ""
+    note = context.get("note") or ""
+    previous_warning = """
+중요:
+- 이전에 저장했던 다른 사진/다른 기록 내용은 절대 참고하지 마.
+- 지금 전달한 사진과 지금 전달한 기록만 보고 골라.
+- 모든 추천 후보가 같은 분위기나 같은 가족/부모 노래로 반복되면 안 돼.
+- 추천할 만한 곡이 애매하면 아래 random_pool처럼 다양한 한국 노래 중에서 고르게 섞어.
+"""
+
+    prompt = f"""
+너는 Re:Play의 음악 큐레이터야.
+현재 사진과 현재 사용자의 기록만 보고, Spotify 검색에 넣을 한국 노래 검색어 후보를 10개 만들어줘.
+
+사진 분석:
+- 장면: {label}
+- 키워드: {keywords}
+- 질문: {questions}
+
+사용자 기록/답변:
+{answers or note or "직접 기록 없음. 사진 분석만 사용."}
+
+{previous_warning}
+
+규칙:
+- 결과는 반드시 한국 노래 위주.
+- 곡명 + 가수 형태를 우선. 예: "바람이 불어오는 곳 김광석"
+- 사진/기록과 맞는 후보를 앞쪽에 배치하되, 후보들이 서로 너무 비슷하면 안 됨.
+- "어머니", "아버지", "가족사진" 같은 가족 노래만 반복하지 마. 정말 가족/부모 기록일 때만 일부 포함.
+- 동요, 키즈, 교육용, 뽀로로, 핑크퐁, 100명의 위인들 같은 곡은 제외.
+- 기록이 생일이면 생일/축하/가족 분위기 3~4개 + 따뜻한 추억 노래를 섞어.
+- 기록이 여행이면 여행/길/바다/나들이 느낌 곡을 섞어.
+- 기록이 고향이면 고향/그리움/옛날가요 느낌 곡을 섞어.
+- 기록이 애매하면 무난한 한국 추억 노래를 다양하게 섞어.
+- 추천 이유는 쓰지 마.
+- 반드시 JSON만 반환.
+
+형식:
+{{"queries":["곡명 가수","곡명 가수","곡명 가수","곡명 가수","곡명 가수","곡명 가수","곡명 가수","곡명 가수","곡명 가수","곡명 가수"]}}
+"""
+    data = ask_gemini_json(prompt, image_path=context.get("photo_path"), timeout=35)
+    queries = clean_music_queries((data or {}).get("queries") or [])
+
+    # Gemini가 너무 적게 주거나 이상하면 현재 사진/기록 seed 기반 랜덤 풀로 채운다.
+    random_queries = random_music_queries(context, count=12)
+    queries = clean_music_queries(queries + random_queries)
+
+    st.session_state["last_ai_music_query"] = " / ".join(queries[:4])
+    return queries[:12]
+
+
+
 def spotify_recommendations(query="한국 옛날가요 추억"):
-    """Search Spotify with varied, image-matched Korean music queries."""
+    """Search Spotify using the current photo/record AI search plan."""
     query_text_original = str(query or "").strip()
-    query_text = query_text_original.lower()
-    seed_text = music_diversity_seed(query_text_original)
+    context = current_music_context(st.session_state.get("play_memory") or {})
+    seed_text = music_context_seed(context)
 
-    local_tracks_for_query = local_music_tracks(query_text_original)
+    # AI 추천일 때는 photo_music_query가 만든 plan만 사용한다.
+    is_ai_plan = query_text_original == st.session_state.get("music_plan_token")
+    if is_ai_plan:
+        search_queries = clean_music_queries(st.session_state.get("music_search_plan") or [])
+        if not search_queries:
+            search_queries = random_music_queries(context, count=10)
+    else:
+        search_queries = clean_music_queries([query_text_original] if query_text_original else random_music_queries(context, count=10))
 
-    base_query = query_text_original or "한국 옛날가요 추억"
-    search_queries = varied_search_queries(
-        base_query,
-        ["바람이 불어오는 곳 김광석", "옛사랑 이문세", "사랑으로 해바라기", "내 마음의 보석상자 해바라기", "걱정말아요 그대 전인권", "Bravo My Life 봄여름가을겨울"],
-        seed_text,
-        max_items=7,
-        base_last=True,
-    )
-    fallback_pairs = [
-        ("오래된 노래", "스탠딩 에그"),
-        ("바람이 불어오는 곳", "김광석"),
-        ("내 마음의 보석상자", "해바라기"),
-        ("옛사랑", "이문세"),
-        ("그리움만 쌓이네", "여진"),
-        ("사랑으로", "해바라기"),
-        ("걱정말아요 그대", "전인권"),
-        ("Bravo My Life", "봄여름가을겨울"),
-    ]
+    local_tracks_for_query = [] if is_ai_plan else local_music_tracks(query_text_original)
 
-    situation_rules = [
-        (
-            ("birthday", "생일", "돌잔치", "백일", "축하", "케이크", "촛불", "파티", "잔치"),
-            "한국 생일 축하 가족 추억",
-            ["생일 가람과 뫼", "생일 축하합니다 권진원", "당신은 사랑받기 위해 태어난 사람", "축하합니다", "인연 이승철", "사랑으로 해바라기", "가족사진 김진호", "happy birthday korean"],
-            [
-                ("생일", "가람과 뫼"),
-                ("당신은 사랑받기 위해 태어난 사람", "축복송"),
-                ("인연", "이승철"),
-                ("사랑으로", "해바라기"),
-                ("가족사진", "김진호"),
-                ("축하합니다", "축하 노래"),
-                ("생일 축하합니다", "권진원"),
-                ("Happy Birthday To You", "Birthday Song"),
-            ],
-        ),
-        (
-            ("결혼", "부부", "신혼", "아내", "남편", "연인", "사랑", "데이트", "약혼", "웨딩"),
-            "한국 사랑 부부 결혼 추억",
-            ["님과 함께 남진", "사랑으로 해바라기", "내 사랑 내 곁에 김현식", "그대 그리고 나 소리새", "사랑하기 때문에 유재하", "인연 이선희", "그대 내 맘에 들어오면은 조덕배", "당신은 모르실거야 혜은이"],
-            [
-                ("님과 함께", "남진"),
-                ("사랑으로", "해바라기"),
-                ("내 사랑 내 곁에", "김현식"),
-                ("그대 그리고 나", "소리새"),
-                ("사랑하기 때문에", "유재하"),
-                ("인연", "이선희"),
-                ("그대 내 맘에 들어오면은", "조덕배"),
-                ("당신은 모르실거야", "혜은이"),
-            ],
-        ),
-        (
-            ("mother", "어머니", "엄마", "아버지", "아빠", "부모", "부모님", "가족", "손주", "자녀", "아이", "아기", "딸", "아들", "family"),
-            "한국 가족 부모님 추억",
-            ["가족사진 김진호", "엄마 라디", "아버지 싸이", "엄마가 딸에게 양희은", "부모 유주용", "어머님 은혜", "사랑으로 해바라기", "고향의 봄"],
-            [
-                ("가족사진", "김진호"),
-                ("엄마", "Ra.D"),
-                ("아버지", "PSY"),
-                ("엄마가 딸에게", "양희은"),
-                ("부모", "유주용"),
-                ("어머님 은혜", "가족 노래"),
-                ("사랑으로", "해바라기"),
-                ("고향의 봄", "동요"),
-            ],
-        ),
-        (
-            ("hometown", "고향", "시골", "마을", "옛집", "우리집", "집", "그리움", "그립"),
-            "한국 고향 그리움 추억",
-            ["고향역 나훈아", "머나먼 고향 나훈아", "타향살이 고복수", "꿈에 본 내 고향", "고향의 봄", "그리움만 쌓이네 여진", "찔레꽃 백난아", "섬마을 선생님 이미자"],
-            [
-                ("고향역", "나훈아"),
-                ("머나먼 고향", "나훈아"),
-                ("타향살이", "고복수"),
-                ("꿈에 본 내 고향", "고향 노래"),
-                ("고향의 봄", "동요"),
-                ("그리움만 쌓이네", "여진"),
-                ("찔레꽃", "백난아"),
-                ("섬마을 선생님", "이미자"),
-            ],
-        ),
-        (
-            ("travel", "trip", "beach", "여행", "바다", "해변", "산", "나들이", "소풍", "제주", "기차", "버스", "길"),
-            "한국 여행 나들이 추억",
-            ["여행을 떠나요 조용필", "제주도의 푸른 밤 최성원", "바람이 불어오는 곳 김광석", "남행열차 김수희", "바다의 왕자", "아름다운 강산 이선희", "목포행 완행열차 장윤정", "젊은 그대 김수철"],
-            [
-                ("여행을 떠나요", "조용필"),
-                ("제주도의 푸른 밤", "최성원"),
-                ("바람이 불어오는 곳", "김광석"),
-                ("남행열차", "김수희"),
-                ("바다의 왕자", "박명수"),
-                ("아름다운 강산", "이선희"),
-                ("목포행 완행열차", "장윤정"),
-                ("젊은 그대", "김수철"),
-            ],
-        ),
-        (
-            ("friend", "school", "graduation", "친구", "동창", "학교", "졸업", "교복", "교실", "학창", "청춘"),
-            "한국 친구 학교 청춘 추억",
-            ["친구여 조용필", "친구에게 양희은", "젊은 그대 김수철", "졸업 전람회", "친구 안재욱", "청춘 산울림", "이젠 안녕 015B", "걱정말아요 그대 전인권"],
-            [
-                ("친구여", "조용필"),
-                ("친구에게", "양희은"),
-                ("젊은 그대", "김수철"),
-                ("졸업", "전람회"),
-                ("친구", "안재욱"),
-                ("청춘", "산울림"),
-                ("이젠 안녕", "공일오비"),
-                ("걱정말아요 그대", "전인권"),
-            ],
-        ),
-        (
-            ("직장", "회사", "일터", "동료", "일하", "청년", "젊은", "꿈", "노력", "성공", "취업"),
-            "한국 청춘 인생 꿈 응원",
-            ["젊은 그대 김수철", "걱정말아요 그대 전인권", "아름다운 강산 이선희", "Bravo My Life 봄여름가을겨울", "거위의 꿈 인순이", "서른 즈음에 김광석", "일어나 김광석", "말하는 대로 처진 달팽이"],
-            [
-                ("젊은 그대", "김수철"),
-                ("걱정말아요 그대", "전인권"),
-                ("아름다운 강산", "이선희"),
-                ("Bravo My Life", "봄여름가을겨울"),
-                ("거위의 꿈", "인순이"),
-                ("서른 즈음에", "김광석"),
-                ("일어나", "김광석"),
-                ("말하는 대로", "처진 달팽이"),
-            ],
-        ),
-        (
-            ("군대", "군복", "전우", "훈련", "병장", "군인"),
-            "한국 군대 전우 청춘 추억",
-            ["전우야 잘자라", "전우 군가", "진짜 사나이 군가", "청춘 김필", "젊은 그대 김수철", "아름다운 강산 이선희", "친구여 조용필"],
-            [
-                ("전우야 잘자라", "군가"),
-                ("전우", "추억의 군가"),
-                ("진짜 사나이", "군가"),
-                ("청춘", "김필"),
-                ("젊은 그대", "김수철"),
-                ("아름다운 강산", "이선희"),
-                ("친구여", "조용필"),
-                ("일어나", "김광석"),
-            ],
-        ),
-        (
-            ("명절", "설날", "추석", "제사", "모임", "식사", "밥", "시장", "장날", "음식"),
-            "한국 가족 모임 명절 추억",
-            ["고향의 봄", "고향역 나훈아", "가족사진 김진호", "사랑으로 해바라기", "어머님 은혜", "즐거운 나의 집", "찔레꽃 백난아", "엄마가 딸에게 양희은"],
-            [
-                ("고향의 봄", "동요"),
-                ("고향역", "나훈아"),
-                ("가족사진", "김진호"),
-                ("사랑으로", "해바라기"),
-                ("어머님 은혜", "가족 노래"),
-                ("즐거운 나의 집", "동요"),
-                ("찔레꽃", "백난아"),
-                ("엄마가 딸에게", "양희은"),
-            ],
-        ),
-        (
-            ("이별", "보고싶", "보고 싶", "눈물", "슬픔", "돌아가", "떠나", "추모", "마지막"),
-            "한국 그리움 이별 추억 발라드",
-            ["그리움만 쌓이네 여진", "옛사랑 이문세", "내 사랑 내 곁에 김현식", "사랑했지만 김광석", "보고싶다 김범수", "잊혀진 계절 이용", "가을 편지 최양숙", "너무 아픈 사랑은 사랑이 아니었음을 김광석"],
-            [
-                ("그리움만 쌓이네", "여진"),
-                ("옛사랑", "이문세"),
-                ("내 사랑 내 곁에", "김현식"),
-                ("사랑했지만", "김광석"),
-                ("보고싶다", "김범수"),
-                ("잊혀진 계절", "이용"),
-                ("가을 편지", "최양숙"),
-                ("너무 아픈 사랑은 사랑이 아니었음을", "김광석"),
-            ],
-        ),
-    ]
-
-    for keywords, fixed_query, candidate_queries, fixed_pairs in situation_rules:
-        if any(word in query_text for word in keywords):
-            base_query = fixed_query
-            # 핵심: broad query를 맨 앞에 두지 말고, 사진/답변 seed로 섞인 구체 곡명 후보부터 검색한다.
-            search_queries = varied_search_queries(fixed_query, candidate_queries, seed_text, max_items=8, base_last=True)
-            fallback_pairs = stable_shuffle(fixed_pairs, seed_text)
-            break
-
-    # 계절도 broad query가 아니라 섞인 후보부터 검색
-    if any(word in query_text for word in ("봄", "꽃", "벚꽃")):
-        search_queries = varied_search_queries("한국 봄 추억", ["봄날은 간다", "봄봄봄", "꽃밭에서 정훈희", "벚꽃엔딩", "봄비 이은하", "봄 처녀"], seed_text, max_items=7)
-    elif any(word in query_text for word in ("여름", "여름날")):
-        search_queries = varied_search_queries("한국 여름 추억", ["여름 안에서", "바다의 왕자", "여행을 떠나요", "해변으로 가요", "바다새", "여름밤의 꿈"], seed_text, max_items=7)
-    elif any(word in query_text for word in ("가을", "낙엽")):
-        search_queries = varied_search_queries("한국 가을 그리움", ["잊혀진 계절 이용", "가을 편지", "가을 우체국 앞에서", "옛사랑 이문세", "가을 사랑", "낙엽 따라 가버린 사랑"], seed_text, max_items=7)
-    elif any(word in query_text for word in ("겨울", "눈", "크리스마스")):
-        search_queries = varied_search_queries("한국 겨울 추억", ["겨울아이", "눈의 꽃", "크리스마스 캐롤", "겨울바다", "첫눈", "하얀 겨울"], seed_text, max_items=7)
-
-    fallback_pairs = stable_shuffle(fallback_pairs, seed_text)
-    fallback = fallback_tracks_from_pairs(fallback_pairs)
-
-    def search_spotify_once(token, q, limit=3):
+    def search_spotify_once(token, q, limit=4):
         response = requests.get(
             "https://api.spotify.com/v1/search",
             headers={"Authorization": f"Bearer {token}"},
@@ -2376,29 +2355,40 @@ def spotify_recommendations(query="한국 옛날가요 추억"):
                 found.append(track)
         return found
 
+    fallback = fallback_tracks_from_pairs([
+        tuple(q.rsplit(" ", 1)) if " " in q else (q, "한국 노래")
+        for q in random_music_queries(context, count=10)
+    ])
+
     try:
         token = get_spotify_token()
         if not token:
-            return shuffle_tracks_for_memory(fallback, seed_text)
+            return shuffle_tracks_for_memory(fallback, seed_text)[:12]
 
         tracks = []
-        for q in search_queries[:8]:
+        # 핵심: broad category query가 아니라 AI가 만든 현재 사진/기록 후보곡을 하나씩 검색
+        for q in search_queries[:10]:
             tracks = merge_unique_tracks(tracks, search_spotify_once(token, q, limit=3))
             if len(tracks) >= 12:
                 break
 
+        # 너무 적게 잡히면 랜덤 풀로 보충
+        if len(tracks) < 8:
+            for q in random_music_queries(context, count=10):
+                tracks = merge_unique_tracks(tracks, search_spotify_once(token, q, limit=2))
+                if len(tracks) >= 12:
+                    break
+
         tracks = shuffle_tracks_for_memory(merge_unique_tracks(tracks, fallback), seed_text)
 
-        # 직접 검색으로 로컬곡명이 들어온 경우에만 로컬곡 포함
-        if query_text_original and local_tracks_for_query:
+        if local_tracks_for_query:
             return merge_unique_tracks(local_tracks_for_query, tracks)[:14]
-
         return tracks[:14]
 
     except Exception:
-        if query_text_original and local_tracks_for_query:
-            return merge_unique_tracks(local_tracks_for_query, shuffle_tracks_for_memory(fallback, seed_text))
-        return shuffle_tracks_for_memory(fallback, seed_text)
+        if local_tracks_for_query:
+            return merge_unique_tracks(local_tracks_for_query, shuffle_tracks_for_memory(fallback, seed_text))[:14]
+        return shuffle_tracks_for_memory(fallback, seed_text)[:12]
 
 
 DEFAULT_TRACK_LYRICS = [
@@ -2650,12 +2640,19 @@ def filtered_music_tracks(tracks, query):
 
 def recorded_text_for_music(memory=None):
     memory = memory or {}
-    text_candidates = [
-        memory_record_text(memory, include_questions=False),
-        memory.get("note"),
-        st.session_state.get("memory_text"),
-    ]
-    answers = memory.get("question_answers") or st.session_state.get("question_answers") or {}
+    current_id = str(st.session_state.get("memory_id") or st.session_state.get("selected_memory_id") or "")
+    memory_id = str(memory.get("id") or "")
+    same_memory = (not memory_id) or (not current_id) or memory_id == current_id
+
+    text_candidates = []
+    if same_memory:
+        text_candidates.extend([
+            memory_record_text(memory, include_questions=False),
+            memory.get("note"),
+        ])
+    text_candidates.append(st.session_state.get("memory_text"))
+
+    answers = (memory.get("question_answers") if same_memory else None) or st.session_state.get("question_answers") or {}
     if isinstance(answers, dict):
         text_candidates.append(" ".join(str(value).strip() for value in answers.values() if str(value).strip()))
     elif isinstance(answers, list):
@@ -2734,112 +2731,26 @@ def rule_based_korean_music_query(memory=None):
 
 
 def ai_answer_based_music_query(memory=None):
-    """Make a fresh Korean music search query from current photo + current answers.
-
-    중요:
-    - 이전 추천 캐시를 쓰지 않는다.
-    - 음악 화면에 들어갈 때마다 현재 질문 답변 기준으로 새로 만든다.
-    - 추천 이유는 만들지 않고 검색어만 만든다.
-    """
+    """Create a fresh Spotify search plan from current photo + current record only."""
     memory = memory or {}
-    answer_text = recorded_text_for_music(memory)
-    if not answer_text:
-        return ""
+    queries = ai_music_search_queries(memory)
+    if not queries:
+        context = current_music_context(memory)
+        queries = random_music_queries(context, count=10)
 
-    fallback_query = rule_based_korean_music_query(memory)
-
-    if not GEMINI_API_KEY:
-        st.session_state["last_ai_music_query"] = fallback_query
-        return fallback_query
-
-    questions = memory.get("questions") or st.session_state.get("questions") or []
-    keywords = memory.get("keywords") or st.session_state.get("keywords") or []
-    label = str(memory.get("analysis_label") or st.session_state.get("analysis_label") or "").strip()
-
-    prompt = f"""
-너는 노년층의 사진 회상 기록에 어울리는 한국 노래를 추천하기 위한 검색어를 만드는 AI야.
-사진 분석과 사용자가 질문에 답한 기록을 함께 보고 Spotify 검색에 넣을 한국어 검색어 하나만 만들어줘.
-
-사진 분석:
-- 장면: {label}
-- 키워드: {", ".join(str(item) for item in keywords)}
-- 질문: {" / ".join(str(item) for item in questions[:3])}
-
-사용자 답변:
-{answer_text}
-
-규칙:
-- 사진보다 사용자의 답변 감정을 더 중요하게 반영.
-- 먼저 상황을 판단해: 생일/축하, 가족/부모, 고향/그리움, 여행/나들이, 친구/학교/졸업, 결혼/부부/사랑, 직장/젊은시절, 군대/전우, 명절/가족모임, 이별/추모 중 하나를 골라.
-- 답변에 있는 핵심 단어는 검색어에 반드시 포함해. 예: 생일, 케이크, 엄마, 고향, 친구, 결혼, 여행.
-- 한국 노래 위주로 검색되게 작성.
-- 노년층에게 익숙한 7080, 트로트, 포크, 옛날가요, 발라드 감성을 우선.
-- 추천 이유는 쓰지 말고 검색어만 JSON으로 반환.
-- 너무 긴 문장 금지. 6~14단어 정도.
-- 반드시 JSON만 반환.
-
-형식:
-{{"music_query":"한국 노래 검색어"}}
-"""
-    data = ask_gemini_json(
-        prompt,
-        image_path=photo_path_for_memory(memory) or st.session_state.get("photo_path"),
-        timeout=35,
-    )
-    query = str((data or {}).get("music_query") or "").strip()
-    if not query:
-        query = fallback_query
-
-    # 답변 안에 생일/가족/고향/여행 같은 명확한 상황 단어가 있으면
-    # Gemini가 애매하게 만든 검색어보다 상황별 보정 검색어를 우선한다.
-    generic_query = "한국 추억 옛날가요 가족 회상 노래"
-    if fallback_query and fallback_query != generic_query:
-        query = fallback_query
-
-    # 디버그 확인용: 화면 디자인에는 표시하지 않고 session_state에만 보관
-    st.session_state["last_ai_music_query"] = query
-    return query
+    token_source = "|".join(queries[:10]) + "|" + str(st.session_state.get("memory_id") or "")
+    token = "AI_PLAN_" + hashlib.sha256(token_source.encode("utf-8")).hexdigest()[:12]
+    st.session_state["music_search_plan"] = queries
+    st.session_state["music_plan_token"] = token
+    st.session_state["last_ai_music_query"] = " / ".join(queries[:4])
+    return token
 
 def photo_music_query(memory=None):
-    memory = memory or {}
+    """Return a token for the current photo/record music recommendation plan.
 
-    # 답변이 있으면 사진 + 답변을 같이 분석해서 한국 노래 추천 검색어를 만든다.
-    answer_based_query = ai_answer_based_music_query(memory)
-    if answer_based_query:
-        return answer_based_query
-
-    explicit_query = str(memory.get("music_query") or st.session_state.get("music_query") or "").strip()
-    if explicit_query:
-        # Gemini가 만든 music_query만 단독 사용하면 여러 사진이 같은 검색어로 고정될 수 있어서
-        # 현재 사진의 장면/키워드도 함께 붙인다.
-        label_for_query = str(memory.get("analysis_label") or st.session_state.get("analysis_label") or "").strip()
-        keywords_for_query = " ".join(str(item) for item in (memory.get("keywords") or st.session_state.get("keywords") or []))
-        return " ".join(part for part in [explicit_query, label_for_query, keywords_for_query] if part).strip()
-
-    categories = (
-        memory.get("suggested_categories")
-        or memory_categories(memory)
-        or st.session_state.get("suggested_categories")
-        or st.session_state.get("selected_categories")
-        or []
-    )
-    keywords = memory.get("keywords") or st.session_state.get("keywords", [])
-    label = str(memory.get("analysis_label") or st.session_state.get("analysis_label") or "").strip()
-    scene_text = " ".join([label] + [str(item) for item in categories + keywords])
-
-    if any(word in scene_text for word in ("생일", "파티", "축하", "케이크")):
-        return "한국 생일 축하 가족 추억 노래"
-    if any(word in scene_text for word in ("여행", "바다", "여름", "휴가", "나들이")):
-        return "한국 여행 추억 7080 포크 노래"
-    if any(word in scene_text for word in ("학교", "졸업", "친구", "교복")):
-        return "한국 청춘 친구 추억 노래"
-    if any(word in scene_text for word in ("결혼", "예식", "약속")):
-        return "한국 사랑 부부 추억 노래"
-    if any(word in scene_text for word in ("가족", "부모", "아이", "아기")):
-        return "한국 가족 부모님 그리움 추억 노래"
-    if scene_text.strip():
-        return f"{scene_text} 한국 추억 노래 7080"
-    return "한국 옛날 노래 추억 회상 7080"
+    이전 사진/기록의 추천어를 재사용하지 않는다.
+    """
+    return ai_answer_based_music_query(memory or {})
 
 def category_candidates():
     keywords = [word for word in st.session_state.get("keywords", []) if word]
@@ -6642,7 +6553,6 @@ elif page == "music":
         recorded_text_for_music(memory),
         str(memory.get("analysis_label") or st.session_state.get("analysis_label") or ""),
         " ".join(str(item) for item in (memory.get("keywords") or st.session_state.get("keywords") or [])),
-        str(memory.get("music_query") or st.session_state.get("music_query") or ""),
         str(st.session_state.get("music_random_salt") or ""),
     ])
     if (
