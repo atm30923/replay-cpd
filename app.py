@@ -4763,14 +4763,14 @@ div[data-testid="stVerticalBlock"] {{ gap:.55rem !important; }}
     border:1px solid rgba(217,74,53,.25) !important;
     box-shadow:0 8px 16px rgba(0,0,0,.06) !important;
 }}
-.st-key-home_record_footer, .st-key-home_play_footer {{ position:fixed !important; bottom:54px !important; z-index:30 !important; width:360px !important; }}
-.st-key-home_record_footer {{ left:calc(50vw - 430px) !important; }}
-.st-key-home_play_footer {{ right:calc(50vw - 430px) !important; }}
-.st-key-home_record_footer button, .st-key-home_play_footer button {{ height:64px !important; border-radius:22px !important; font-size:20px !important; font-weight:1000 !important; box-shadow:0 14px 30px rgba(0,0,0,.12) !important; }}
+.st-key-home_record_footer, .st-key-home_play_footer {{ position:absolute !important; bottom:24px !important; z-index:30 !important; width:360px !important; }}
+.st-key-home_record_footer {{ left:112px !important; }}
+.st-key-home_play_footer {{ right:112px !important; }}
+.st-key-home_record_footer button, .st-key-home_play_footer button {{ height:58px !important; border-radius:20px !important; font-size:19px !important; font-weight:1000 !important; box-shadow:0 14px 30px rgba(0,0,0,.12) !important; }}
 .st-key-home_record_footer button {{ background:#111 !important; color:#fff !important; }}
 .st-key-home_play_footer button {{ background:#fff !important; color:#111 !important; }}
 @media (max-width:900px) {{
-    .block-container {{ max-width:820px !important; padding:28px 26px 112px !important; }}
+    .block-container {{ max-width:820px !important; padding:28px 26px 128px !important; }}
     .home-title-row, .home-divider {{ margin-left:28px; margin-right:28px; }}
     .st-key-home_record_footer, .st-key-home_play_footer {{ position:static !important; width:auto !important; }}
 }}
@@ -6785,21 +6785,21 @@ div[data-testid="stAudio"] {
     display:none !important;
 }
 .music-list-title {
-    margin:26px 0 14px;
+    margin:20px 0 10px;
     color:#111;
     font-size:17px;
     line-height:1;
     font-weight:1000;
 }
 .music-row-spacer {
-    height:63px;
+    height:55px;
     display:flex;
     align-items:center;
 }
 .music-row-line {
     height:1px;
     width:440px;
-    margin:-3px 0 0 58px;
+    margin:-4px 0 0 58px;
     background:rgba(0,0,0,.075);
 }
 .music-track-cover {
@@ -6885,18 +6885,18 @@ div[data-testid="stAudio"] {
     box-shadow:none !important;
     font-size:12px !important;
     font-weight:900 !important;
-    margin-top:12px !important;
+    margin-top:6px !important;
 }
 .music-notice {
     height:18px;
     color:#ef5a28;
     font-size:12px;
     font-weight:900;
-    margin:7px 0 10px;
+    margin:4px 0 8px;
 }
 .st-key-music_add_done button {
-    height:62px !important;
-    min-height:62px !important;
+    height:56px !important;
+    min-height:56px !important;
     border-radius:7px !important;
     background:#050505 !important;
     color:#fff !important;
@@ -6976,7 +6976,9 @@ div[data-testid="stAudio"] {
             if search_text:
                 st.warning("검색 결과가 없어 기본 추천 음악을 보여드려요.")
 
-        visible_count = len(visible_tracks) if st.session_state.get("music_show_more") else min(5, len(visible_tracks))
+        # 더보기 상태에서도 전체를 한 번에 다 펼치면 iPad 화면에서
+        # 추가하기 버튼과 접기 버튼이 아래로 밀려 사라지므로 7개까지만 확장한다.
+        visible_count = min(7, len(visible_tracks)) if st.session_state.get("music_show_more") else min(5, len(visible_tracks))
         for index, track in enumerate(visible_tracks[:visible_count]):
             track = normalized_music_track(track)
             is_selected = (
@@ -7012,7 +7014,7 @@ div[data-testid="stAudio"] {
                 html('<div class="music-row-line"></div>')
 
         if len(visible_tracks) > 5:
-            more_label = "접기" if st.session_state.get("music_show_more") else "더 많은 음악 보기  ⌄"
+            more_label = "접기  ⌃" if st.session_state.get("music_show_more") else "더 많은 음악 보기  ⌄"
             if st.button(more_label, key="music_more_button", use_container_width=True):
                 st.session_state.music_show_more = not st.session_state.get("music_show_more")
                 st.rerun()
