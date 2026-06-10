@@ -3,3 +3,4 @@ requests
 python-dotenv
 pillow
 streamlit-drawable-canvas
+google-genai
