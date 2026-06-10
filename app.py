@@ -803,6 +803,7 @@ def questions_look_fixed(questions):
 
 
 def question_seed_text(result=None):
+    import hashlib
     result = result or {}
     parts = [
         str(st.session_state.get("question_random_salt") or ""),
@@ -816,6 +817,7 @@ def question_seed_text(result=None):
 
 
 def pick_question_set(question_sets, result=None, extra=""):
+    import hashlib
     seed = question_seed_text(result) + "|" + str(extra or "")
     digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()
     index = int(digest[:8], 16) % max(len(question_sets), 1)
@@ -1007,35 +1009,44 @@ def scene_based_questions_from_result(result):
 
 def make_questions_unique_and_contextual(result):
     """Ensure questions are not old fixed questions and are image-matched."""
-    result = dict(result or fallback_photo_analysis())
-    questions = result.get("questions") or []
-    label = str(result.get("analysis_label") or result.get("scene_label") or "")
-    keywords = [str(item).strip() for item in (result.get("keywords") or []) if str(item).strip()]
-    context_words = [word for word in re.split(r"\s+", label + " " + " ".join(keywords)) if len(word) >= 2]
+    try:
+        result = dict(result or fallback_photo_analysis())
+        questions = result.get("questions") or []
+        label = str(result.get("analysis_label") or result.get("scene_label") or "")
+        keywords = [str(item).strip() for item in (result.get("keywords") or []) if str(item).strip()]
+        context_words = [word for word in re.split(r"\s+", label + " " + " ".join(keywords)) if len(word) >= 2]
 
-    def has_context_word(question):
-        question = str(question or "")
-        return any(word in question for word in context_words[:6])
+        def has_context_word(question):
+            question = str(question or "")
+            return any(word in question for word in context_words[:6])
 
-    generic_patterns = ("이 사진", "사진 속 사람", "어떤 추억", "어떤 날", "가장 먼저 떠오르는 감정")
-    generic_count = sum(1 for item in questions[:3] if any(pattern in str(item) for pattern in generic_patterns))
-    context_count = sum(1 for item in questions[:3] if has_context_word(item))
+        generic_patterns = ("이 사진", "사진 속 사람", "어떤 추억", "어떤 날", "가장 먼저 떠오르는 감정")
+        generic_count = sum(1 for item in questions[:3] if any(pattern in str(item) for pattern in generic_patterns))
+        context_count = sum(1 for item in questions[:3] if has_context_word(item))
 
-    if questions_look_fixed(questions) or generic_count >= 2 or context_count == 0:
-        questions = scene_based_questions_from_result(result)
+        if questions_look_fixed(questions) or generic_count >= 2 or context_count == 0:
+            questions = scene_based_questions_from_result(result)
 
-    # 혹시 중복 문장이 있으면 상황 기반 질문으로 교체
-    clean = []
-    for q in questions:
-        q = str(q or "").strip()
-        if q and q not in clean:
-            clean.append(q)
-    if len(clean) < 3:
-        clean = scene_based_questions_from_result(result)
+        clean = []
+        for q in questions:
+            q = str(q or "").strip()
+            if q and q not in clean:
+                clean.append(q)
+        if len(clean) < 3:
+            clean = scene_based_questions_from_result(result)
 
-    result["questions"] = clean[:3]
-    result["question"] = result["questions"][0]
-    return result
+        result["questions"] = clean[:3]
+        result["question"] = result["questions"][0]
+        return result
+    except Exception:
+        fallback = fallback_photo_analysis()
+        fallback["questions"] = [
+            "사진 속 장면에서 가장 먼저 눈에 들어오는 순간은 무엇인가요?",
+            "이때 함께했던 사람이나 장소에 대해 기억나는 이야기가 있나요?",
+            "이 기억을 지금 다시 떠올리면 어떤 말을 남기고 싶나요?",
+        ]
+        fallback["question"] = fallback["questions"][0]
+        return fallback
 
 
 def analyze_photo_with_gemini(path):
@@ -1163,7 +1174,12 @@ def update_photo_analysis(force=False):
     ):
         return
 
-    result = make_questions_unique_and_contextual(analyze_photo_with_ai(current_photo_for_analysis))
+    try:
+        result = make_questions_unique_and_contextual(analyze_photo_with_ai(current_photo_for_analysis))
+    except Exception:
+        # API 오류/NameError/JSON 오류가 나도 앱이 멈추지 않게 사진 기반 기본 질문으로 복구
+        result = make_questions_unique_and_contextual(fallback_photo_analysis())
+
     st.session_state.keywords = result["keywords"]
     st.session_state.analysis_label = result.get("analysis_label", "사진 속 순간")
     st.session_state.question = result["question"]
@@ -1182,7 +1198,6 @@ def update_photo_analysis(force=False):
     st.session_state.selected_category = current_category
     st.session_state.selected_categories = [current_category]
     st.session_state.analysis_done = True
-
 
 def ensure_question_answers():
     answers = st.session_state.get("question_answers")
@@ -2066,6 +2081,7 @@ def fallback_tracks_from_pairs(pairs):
 
 
 def music_diversity_seed(extra=""):
+    import hashlib
     """Build a stable seed from current memory/photo/answers.
 
     같은 상황이어도 다른 사진/답변이면 추천 순서와 검색 후보가 달라진다.
@@ -2093,6 +2109,8 @@ def music_diversity_seed(extra=""):
 
 
 def stable_shuffle(items, seed_text):
+    import hashlib
+    import random
     items = list(items or [])
     rng = random.Random(int(hashlib.sha256(str(seed_text).encode("utf-8")).hexdigest()[:12], 16))
     rng.shuffle(items)
