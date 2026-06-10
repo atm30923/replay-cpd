@@ -158,6 +158,8 @@ DEFAULTS = {
     "handwriting_redo_stack": [],
     "analysis_done": False,
     "analysis_photo_path": None,
+    "question_random_salt": "",
+    "music_random_salt": "",
     "analysis_label": "사진 속 순간",
     "suggested_categories": [],
     "music_query": "",
@@ -333,6 +335,8 @@ def reset_flow():
     st.session_state.handwriting_redo_stack = []
     st.session_state.analysis_done = False
     st.session_state.analysis_photo_path = None
+    st.session_state.question_random_salt = ""
+    st.session_state.music_random_salt = ""
     st.session_state.analysis_label = "사진 속 순간"
     st.session_state.suggested_categories = []
     st.session_state.music_query = ""
@@ -372,6 +376,8 @@ def reset_scan_inputs():
     st.session_state.memory_text = ""
     st.session_state.analysis_done = False
     st.session_state.analysis_photo_path = None
+    st.session_state.question_random_salt = ""
+    st.session_state.music_random_salt = ""
     st.session_state.analysis_label = "사진 속 순간"
     st.session_state.suggested_categories = []
     st.session_state.music_query = ""
@@ -475,6 +481,8 @@ def save_photo(file):
     st.session_state.music_last_search_query = ""
     st.session_state.music_recommend_signature = ""
     st.session_state.music_show_more = False
+    st.session_state.question_random_salt = str(uuid.uuid4())[:8]
+    st.session_state.music_random_salt = str(uuid.uuid4())[:8]
 
 
 def restore_photo(memory_id):
@@ -747,7 +755,7 @@ def ask_gemini_json(prompt, image_path=None, timeout=35):
     body = {
         "contents": [{"role": "user", "parts": parts}],
         "generationConfig": {
-            "temperature": 0.35,
+            "temperature": 0.75,
             "maxOutputTokens": 900,
             "responseMimeType": "application/json",
         },
@@ -794,116 +802,240 @@ def questions_look_fixed(questions):
     return generic_hits >= 3
 
 
+def question_seed_text(result=None):
+    result = result or {}
+    parts = [
+        str(st.session_state.get("question_random_salt") or ""),
+        str(st.session_state.get("music_random_salt") or ""),
+        str(st.session_state.get("memory_id") or ""),
+        str(st.session_state.get("photo_path") or ""),
+        str(result.get("analysis_label") or result.get("scene_label") or ""),
+        " ".join(str(item) for item in (result.get("keywords") or [])),
+    ]
+    return "|".join(parts)
+
+
+def pick_question_set(question_sets, result=None, extra=""):
+    seed = question_seed_text(result) + "|" + str(extra or "")
+    digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()
+    index = int(digest[:8], 16) % max(len(question_sets), 1)
+    return list(question_sets[index])
+
+
 def scene_based_questions_from_result(result):
-    """Make non-fixed questions from scene/keywords when AI output is too generic."""
+    """Make non-fixed, image-matched questions.
+
+    같은 상황이라도 사진/메모리 salt에 따라 질문 문장이 달라지게 만든다.
+    """
     result = result or {}
     label = str(result.get("analysis_label") or result.get("scene_label") or "이 장면").strip()
     keywords = " ".join(str(item) for item in (result.get("keywords") or []))
     source = f"{label} {keywords}"
 
-    def pack(q1, q2, q3):
-        return [q1, q2, q3]
-
     if any(w in source for w in ("생일", "축하", "케이크", "촛불", "돌잔치", "파티")):
-        return pack(
-            "케이크와 촛불을 보니, 이날은 누구의 생일을 축하하던 순간이었나요?",
-            "이 생일 자리에 함께 있던 가족이나 사람들은 어떤 표정과 분위기였나요?",
-            "그날 축하받던 사람에게 지금 다시 전하고 싶은 말이 있다면 무엇인가요?",
-        )
-    if any(w in source for w in ("아기", "아이", "어린이", "자녀", "손주")):
-        return pack(
-            "사진 속 아이와 함께하던 이때는 어떤 하루였나요?",
-            "이 아이를 바라보던 가족들의 마음이나 분위기는 어땠나요?",
-            "지금 이 사진을 다시 보면 아이에게 어떤 말을 해주고 싶나요?",
-        )
-    if any(w in source for w in ("가족", "부모", "엄마", "아빠", "어머니", "아버지")):
-        return pack(
-            "가족이 함께 모인 이 장면은 어떤 날의 기억인가요?",
-            "사진 속 가족들과 그때 나누었던 말이나 분위기가 기억나나요?",
-            "이 가족사진을 다시 보며 가장 고맙거나 그리운 사람은 누구인가요?",
-        )
-    if any(w in source for w in ("여행", "바다", "산", "나들이", "소풍", "해변", "제주")):
-        return pack(
-            "이곳으로 떠났던 날, 어떤 마음으로 여행을 시작했나요?",
-            "함께 갔던 사람들과 가장 기억나는 순간은 무엇인가요?",
-            "사진 속 장소의 바람, 소리, 분위기 중 지금도 떠오르는 것이 있나요?",
-        )
-    if any(w in source for w in ("학교", "졸업", "친구", "동창", "교복", "청춘")):
-        return pack(
-            "이 사진은 학창시절이나 친구들과의 어떤 순간을 담고 있나요?",
-            "함께 있던 친구들 중 특히 기억나는 사람이나 일이 있나요?",
-            "그 시절의 나에게 지금 한마디를 해준다면 어떤 말을 해주고 싶나요?",
-        )
-    if any(w in source for w in ("결혼", "부부", "신혼", "사랑", "웨딩")):
-        return pack(
-            "이 사진에 담긴 두 사람의 관계나 약속은 어떤 의미였나요?",
-            "이날 함께했던 사람들과 분위기는 어떻게 기억되나요?",
-            "시간이 지난 지금, 이 순간을 떠올리면 어떤 마음이 가장 크게 남나요?",
-        )
-    if any(w in source for w in ("고향", "시골", "집", "마을", "그리움")):
-        return pack(
-            "이 장소를 보면 가장 먼저 떠오르는 고향의 기억은 무엇인가요?",
-            "그곳에서 함께 지내던 사람들과의 일상은 어땠나요?",
-            "지금 다시 그 시절로 돌아간다면 꼭 해보고 싶은 일은 무엇인가요?",
-        )
-    if any(w in source for w in ("명절", "식사", "밥", "모임", "시장", "음식")):
-        return pack(
-            "이 모임이나 식사 자리는 어떤 날의 기억인가요?",
-            "그때 함께 먹거나 나누었던 음식, 대화 중 기억나는 것이 있나요?",
-            "이 사진을 보며 다시 만나고 싶은 사람은 누구인가요?",
-        )
+        return pick_question_set([
+            [
+                "케이크와 촛불을 보니, 이날은 누구의 생일을 축하하던 순간이었나요?",
+                "이 생일 자리에 함께 있던 가족이나 사람들은 어떤 표정과 분위기였나요?",
+                "그날 축하받던 사람에게 지금 다시 전하고 싶은 말이 있다면 무엇인가요?",
+            ],
+            [
+                "사진 속 생일 케이크 앞에서 가장 기억나는 장면은 무엇인가요?",
+                "촛불을 불던 순간, 주변 사람들은 어떤 말을 해주었나요?",
+                "이 생일 사진을 다시 보니 마음에 가장 크게 남는 감정은 무엇인가요?",
+            ],
+            [
+                "이 축하 자리는 어떻게 준비하게 된 날이었나요?",
+                "사진 속 사람들 중 그날 특히 기억나는 사람은 누구인가요?",
+                "그때의 생일 분위기를 한마디로 표현하면 어떤 느낌인가요?",
+            ],
+        ], result, "birthday")
 
-    # 기본도 고정 질문 문장과 다르게 만든다.
+    if any(w in source for w in ("아기", "아이", "어린이", "자녀", "손주")):
+        return pick_question_set([
+            [
+                "사진 속 아이와 함께하던 이때는 어떤 하루였나요?",
+                "이 아이를 바라보던 가족들의 마음이나 분위기는 어땠나요?",
+                "지금 이 사진을 다시 보면 아이에게 어떤 말을 해주고 싶나요?",
+            ],
+            [
+                "아이의 표정이나 모습 중 지금도 선명하게 기억나는 부분은 무엇인가요?",
+                "이날 아이와 함께 있던 사람들은 어떤 마음이었나요?",
+                "이 시절의 아이에게 다시 전하고 싶은 이야기가 있나요?",
+            ],
+            [
+                "사진 속 아이가 어렸던 이 시절, 집안 분위기는 어땠나요?",
+                "그때 아이를 돌보며 가장 즐거웠거나 힘들었던 기억은 무엇인가요?",
+                "시간이 지난 지금 이 모습을 보니 어떤 마음이 드나요?",
+            ],
+        ], result, "child")
+
+    if any(w in source for w in ("가족", "부모", "엄마", "아빠", "어머니", "아버지")):
+        return pick_question_set([
+            [
+                "가족이 함께 모인 이 장면은 어떤 날의 기억인가요?",
+                "사진 속 가족들과 그때 나누었던 말이나 분위기가 기억나나요?",
+                "이 가족사진을 다시 보며 가장 고맙거나 그리운 사람은 누구인가요?",
+            ],
+            [
+                "이 사진 속 가족들은 어떤 이유로 함께 모였나요?",
+                "그날 가족들 사이에서 가장 따뜻했던 순간은 무엇이었나요?",
+                "지금 이 가족들에게 다시 전하고 싶은 말은 무엇인가요?",
+            ],
+            [
+                "사진 속 가족의 표정에서 어떤 분위기가 느껴지나요?",
+                "이때의 집안 이야기나 함께한 일상 중 기억나는 것이 있나요?",
+                "이 장면을 보면 가장 먼저 떠오르는 가족의 말이나 습관은 무엇인가요?",
+            ],
+        ], result, "family")
+
+    if any(w in source for w in ("여행", "바다", "산", "나들이", "소풍", "해변", "제주")):
+        return pick_question_set([
+            [
+                "이곳으로 떠났던 날, 어떤 마음으로 여행을 시작했나요?",
+                "함께 갔던 사람들과 가장 기억나는 순간은 무엇인가요?",
+                "사진 속 장소의 바람, 소리, 분위기 중 지금도 떠오르는 것이 있나요?",
+            ],
+            [
+                "이 여행지는 누구와 함께 갔던 곳인가요?",
+                "그날 길 위에서 가장 즐거웠던 장면은 무엇이었나요?",
+                "다시 그곳에 간다면 꼭 해보고 싶은 일이 있나요?",
+            ],
+            [
+                "사진 속 풍경을 보니 그때의 날씨나 공기는 어땠나요?",
+                "여행 중 먹었던 음식이나 나누었던 대화가 기억나나요?",
+                "이 여행을 한 단어로 남긴다면 어떤 말이 어울릴까요?",
+            ],
+        ], result, "travel")
+
+    if any(w in source for w in ("학교", "졸업", "친구", "동창", "교복", "청춘")):
+        return pick_question_set([
+            [
+                "이 사진은 학창시절이나 친구들과의 어떤 순간을 담고 있나요?",
+                "함께 있던 친구들 중 특히 기억나는 사람이나 일이 있나요?",
+                "그 시절의 나에게 지금 한마디를 해준다면 어떤 말을 해주고 싶나요?",
+            ],
+            [
+                "사진 속 친구들과는 어떤 사이였고, 자주 무엇을 하며 지냈나요?",
+                "학교나 졸업과 관련해 가장 먼저 떠오르는 기억은 무엇인가요?",
+                "그때 함께 웃었던 순간 중 아직도 생각나는 일이 있나요?",
+            ],
+            [
+                "이 시절의 분위기를 떠올리면 어떤 소리나 장면이 생각나나요?",
+                "사진 속 사람들과 다시 만난다면 가장 먼저 어떤 이야기를 하고 싶나요?",
+                "젊었던 그때의 나에게 지금 전하고 싶은 말은 무엇인가요?",
+            ],
+        ], result, "school")
+
+    if any(w in source for w in ("결혼", "부부", "신혼", "사랑", "웨딩")):
+        return pick_question_set([
+            [
+                "이 사진에 담긴 두 사람의 관계나 약속은 어떤 의미였나요?",
+                "이날 함께했던 사람들과 분위기는 어떻게 기억되나요?",
+                "시간이 지난 지금, 이 순간을 떠올리면 어떤 마음이 가장 크게 남나요?",
+            ],
+            [
+                "이 특별한 날을 준비하면서 가장 기억나는 일은 무엇인가요?",
+                "사진 속 사람에게 그때 하지 못했던 말이 있다면 무엇인가요?",
+                "이 장면을 지금 다시 본다면 어떤 노래가 떠오르나요?",
+            ],
+            [
+                "이 사랑의 순간은 두 사람에게 어떤 시작이었나요?",
+                "그날 주변에서 축하해준 사람들 중 기억나는 사람이 있나요?",
+                "지금까지 남아 있는 가장 따뜻한 약속은 무엇인가요?",
+            ],
+        ], result, "love")
+
+    if any(w in source for w in ("고향", "시골", "집", "마을", "그리움")):
+        return pick_question_set([
+            [
+                "이 장소를 보면 가장 먼저 떠오르는 고향의 기억은 무엇인가요?",
+                "그곳에서 함께 지내던 사람들과의 일상은 어땠나요?",
+                "지금 다시 그 시절로 돌아간다면 꼭 해보고 싶은 일은 무엇인가요?",
+            ],
+            [
+                "사진 속 장소에는 어떤 냄새나 소리가 남아 있나요?",
+                "그 시절 그곳에서 자주 만나던 사람은 누구였나요?",
+                "고향을 떠올리면 마음속에 가장 오래 남는 장면은 무엇인가요?",
+            ],
+            [
+                "이곳에서 보낸 하루 중 가장 평범하지만 소중했던 기억은 무엇인가요?",
+                "사진 속 집이나 마을에서 가족들과 어떤 시간을 보냈나요?",
+                "지금 이 장소에게 한마디를 남긴다면 뭐라고 말하고 싶나요?",
+            ],
+        ], result, "hometown")
+
+    if any(w in source for w in ("명절", "식사", "밥", "모임", "시장", "음식")):
+        return pick_question_set([
+            [
+                "이 모임이나 식사 자리는 어떤 날의 기억인가요?",
+                "그때 함께 먹거나 나누었던 음식, 대화 중 기억나는 것이 있나요?",
+                "이 사진을 보며 다시 만나고 싶은 사람은 누구인가요?",
+            ],
+            [
+                "사진 속 식탁이나 음식에서 가장 먼저 떠오르는 맛은 무엇인가요?",
+                "그날 가족들이 모여 어떤 이야기를 나누었나요?",
+                "이 모임이 지금까지 기억에 남는 이유는 무엇인가요?",
+            ],
+            [
+                "이날 준비했던 음식이나 장소에 얽힌 이야기가 있나요?",
+                "함께 앉아 있던 사람들 중 가장 선명하게 떠오르는 표정은 무엇인가요?",
+                "다시 그날로 돌아가면 꼭 남기고 싶은 말은 무엇인가요?",
+            ],
+        ], result, "gathering")
+
+    # 기본도 고정 질문 문장과 다르게, 그리고 여러 버전 중 하나로 만든다.
     short_label = label if label and label != "사진 속 순간" else "이 장면"
-    return pack(
-        f"{short_label}을 보니, 이 순간은 어떤 일 때문에 남긴 사진인가요?",
-        "사진 속 장소나 사람들 중 지금도 선명하게 기억나는 부분은 무엇인가요?",
-        "그때의 나에게 지금 다시 들려주고 싶은 말이 있다면 무엇인가요?",
-    )
+    return pick_question_set([
+        [
+            f"{short_label}을 보니, 이 순간은 어떤 일 때문에 남긴 사진인가요?",
+            "사진 속 장소나 사람들 중 지금도 선명하게 기억나는 부분은 무엇인가요?",
+            "그때의 나에게 지금 다시 들려주고 싶은 말이 있다면 무엇인가요?",
+        ],
+        [
+            f"{short_label} 속에서 가장 먼저 눈에 들어오는 장면은 무엇인가요?",
+            "이 사진을 찍기 전이나 찍은 뒤에 있었던 일이 기억나나요?",
+            "이 순간을 지금의 가족에게 소개한다면 어떻게 말하고 싶나요?",
+        ],
+        [
+            f"{short_label}이 담긴 이 사진은 어떤 마음으로 간직하고 싶나요?",
+            "사진 속 분위기를 떠올리면 어떤 사람이나 말이 생각나나요?",
+            "이 기억이 오래 남아 있는 이유는 무엇이라고 생각하나요?",
+        ],
+    ], result, "default")
 
 
 def make_questions_unique_and_contextual(result):
-    """Ensure questions are not the old 3 fixed questions."""
+    """Ensure questions are not old fixed questions and are image-matched."""
     result = dict(result or fallback_photo_analysis())
     questions = result.get("questions") or []
-    if questions_look_fixed(questions):
+    label = str(result.get("analysis_label") or result.get("scene_label") or "")
+    keywords = [str(item).strip() for item in (result.get("keywords") or []) if str(item).strip()]
+    context_words = [word for word in re.split(r"\s+", label + " " + " ".join(keywords)) if len(word) >= 2]
+
+    def has_context_word(question):
+        question = str(question or "")
+        return any(word in question for word in context_words[:6])
+
+    generic_patterns = ("이 사진", "사진 속 사람", "어떤 추억", "어떤 날", "가장 먼저 떠오르는 감정")
+    generic_count = sum(1 for item in questions[:3] if any(pattern in str(item) for pattern in generic_patterns))
+    context_count = sum(1 for item in questions[:3] if has_context_word(item))
+
+    if questions_look_fixed(questions) or generic_count >= 2 or context_count == 0:
         questions = scene_based_questions_from_result(result)
-    result["questions"] = questions[:3]
+
+    # 혹시 중복 문장이 있으면 상황 기반 질문으로 교체
+    clean = []
+    for q in questions:
+        q = str(q or "").strip()
+        if q and q not in clean:
+            clean.append(q)
+    if len(clean) < 3:
+        clean = scene_based_questions_from_result(result)
+
+    result["questions"] = clean[:3]
     result["question"] = result["questions"][0]
     return result
-
-
-
-def normalize_photo_analysis_result(data):
-    fallback = fallback_photo_analysis()
-    if not isinstance(data, dict):
-        return None
-
-    keywords = [str(item).strip() for item in data.get("keywords", []) if str(item).strip()]
-    raw_questions = data.get("questions") or [data.get("question", "")]
-    questions = [str(item).strip() for item in raw_questions if str(item).strip()]
-    categories = [str(item).strip() for item in data.get("categories", []) if str(item).strip()]
-    analysis_label = str(data.get("scene_label") or data.get("analysis_label") or "").strip()
-    music_query = str(data.get("music_query") or "").strip()
-
-    if len(keywords) < 3 or len(questions) < 3:
-        return None
-
-    if not analysis_label:
-        analysis_label = keywords[0] if keywords else fallback["analysis_label"]
-    if not categories:
-        categories = fallback["categories"]
-    if not music_query:
-        music_query = " ".join(categories[:2] + keywords[:2]) or fallback["music_query"]
-
-    return {
-        "keywords": keywords[:3],
-        "analysis_label": analysis_label[:28],
-        "question": questions[0],
-        "questions": questions[:3],
-        "categories": categories[:5],
-        "music_query": music_query,
-    }
 
 
 def analyze_photo_with_gemini(path):
@@ -3054,6 +3186,26 @@ body,
 .stApp {
     min-height:100dvh !important;
     overflow:auto !important;
+}
+
+/* iPad Safari에서 입력 글자가 흰색/투명으로 보이는 문제 방지 */
+input,
+textarea,
+div[data-testid="stTextInput"] input,
+div[data-testid="stTextArea"] textarea,
+div[data-baseweb="input"] input,
+div[data-baseweb="textarea"] textarea {
+    color:#111 !important;
+    -webkit-text-fill-color:#111 !important;
+    caret-color:#111 !important;
+    background:#fff !important;
+    opacity:1 !important;
+}
+input::placeholder,
+textarea::placeholder {
+    color:#8a8a8a !important;
+    -webkit-text-fill-color:#8a8a8a !important;
+    opacity:1 !important;
 }
 .stApp .block-container {
     width:min(var(--ipad-shell-width), calc(100vw - (var(--ipad-shell-margin) * 2))) !important;
@@ -6451,6 +6603,7 @@ elif page == "music":
         str(memory.get("analysis_label") or st.session_state.get("analysis_label") or ""),
         " ".join(str(item) for item in (memory.get("keywords") or st.session_state.get("keywords") or [])),
         str(memory.get("music_query") or st.session_state.get("music_query") or ""),
+        str(st.session_state.get("music_random_salt") or ""),
     ])
     if (
         st.session_state.get("music_recommend_signature") != music_recommend_signature
