@@ -6455,7 +6455,29 @@ iframe {
     display:block !important;
     border:0 !important;
 }
+.parent-play-exit-link {
+    position:fixed !important;
+    left:50% !important;
+    top:645px !important;
+    transform:translateX(-50%) !important;
+    width:116px !important;
+    height:42px !important;
+    border-radius:999px !important;
+    background:rgba(255,255,255,.94) !important;
+    color:#111 !important;
+    display:flex !important;
+    align-items:center !important;
+    justify-content:center !important;
+    text-decoration:none !important;
+    font-size:13px !important;
+    line-height:1 !important;
+    font-weight:1000 !important;
+    box-shadow:0 10px 24px rgba(0,0,0,.22) !important;
+    z-index:2147483647 !important;
+    cursor:pointer !important;
+}
 </style>
+<a class="parent-play-exit-link" href="?action=playback_exit" target="_self">종료</a>
 """)
 
     slides_json = json.dumps(steps, ensure_ascii=False)
@@ -6538,24 +6560,11 @@ html, body {
   word-break:keep-all;
   display:none;
 }
-.play-exit-link {
-  display:flex;
-  align-items:center;
-  justify-content:center;
+.play-exit-placeholder {
   width:116px;
   height:42px;
   margin-top:38px;
-  border-radius:999px;
-  background:rgba(255,255,255,.92);
-  color:#111;
-  font-size:13px;
-  line-height:1;
-  font-weight:1000;
-  text-decoration:none;
-  box-shadow:0 10px 24px rgba(0,0,0,.22);
   flex:0 0 auto;
-  border:0;
-  cursor:pointer;
 }
 .native-audio.compact {
   position:absolute;
@@ -6579,7 +6588,7 @@ html, body {
     <div id="slideCounter" class="play-full-counter"></div>
     <div id="slideCaption" class="play-caption"></div>
   </div>
-  <button class="play-exit-link" onclick="window.parent.location.href='?action=playback_exit'">종료</button>
+  <div class="play-exit-placeholder"></div>
   <div id="audioMount"></div>
 </div>
 <script>
