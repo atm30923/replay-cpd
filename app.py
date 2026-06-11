@@ -2206,6 +2206,8 @@ def track_is_bad_for_replay(track):
         "한국을 빛낸", "100명의 위인", "위인들", "동요", "pororo", "뽀로로",
         "핑크퐁", "pinkfong", "tomtomi", "twinkle little studio", "little studio",
         "키즈", "kids", "어린이", "유아", "자장가", "lullaby", "방구뿡", "방구핑",
+        "baby shark", "상어가족", "콩순이", "캐리", "놀이동요", "교육", "율동",
+        "nursery", "children", "childrens", "toddlers", "cocomelon",
     ]
     # 단, 사용자가 생일 검색일 때 일반 happy birthday 계열은 허용
     if "birthday" in combined or "생일 축하" in combined or "축하합니다" in combined:
@@ -2234,6 +2236,195 @@ RANDOM_KOREAN_MUSIC_POOL = [
     "인연 이선희", "가족사진 김진호", "엄마 라디", "아버지 싸이",
     "엄마가 딸에게 양희은", "부모 유주용", "당신은 사랑받기 위해 태어난 사람", "생일 가람과 뫼",
 ]
+
+
+SITUATION_MUSIC_POOLS = {
+    "birthday": [
+        "생일 가람과 뫼", "당신은 사랑받기 위해 태어난 사람 러브", "축복합니다 들국화",
+        "Happy Birthday 권진원", "가족사진 김진호", "사랑으로 해바라기", "좋은 날 아이유",
+        "너의 의미 산울림", "걱정말아요 그대 전인권", "Bravo My Life 봄여름가을겨울",
+    ],
+    "family": [
+        "가족사진 김진호", "엄마 라디", "아버지 싸이", "엄마가 딸에게 양희은",
+        "사랑으로 해바라기", "내 마음의 보석상자 해바라기", "걱정말아요 그대 전인권",
+        "바람이 불어오는 곳 김광석", "그대 그리고 나 소리새", "당신은 사랑받기 위해 태어난 사람",
+    ],
+    "travel": [
+        "여행을 떠나요 조용필", "제주도의 푸른 밤 최성원", "바람이 불어오는 곳 김광석",
+        "남행열차 김수희", "출발 김동률", "걷다 윤건", "일어나 김광석",
+        "아름다운 강산 이선희", "청춘 산울림", "Bravo My Life 봄여름가을겨울",
+    ],
+    "hometown": [
+        "고향역 나훈아", "머나먼 고향 나훈아", "꿈에 본 내 고향", "타향살이 고복수",
+        "찔레꽃 백난아", "그리움만 쌓이네 여진", "옛사랑 이문세", "가을 편지 최양숙",
+        "바람이 불어오는 곳 김광석", "너무 아픈 사랑은 사랑이 아니었음을 김광석",
+    ],
+    "wedding": [
+        "사랑하기 때문에 유재하", "그대 그리고 나 소리새", "인연 이선희", "님과 함께 남진",
+        "결혼해 줄래 이승기", "내 사랑 내 곁에 김현식", "너의 의미 산울림",
+        "사랑으로 해바라기", "청혼 노을", "다행이다 이적",
+    ],
+    "school": [
+        "친구여 조용필", "친구 안재욱", "청춘 산울림", "이젠 안녕 015B",
+        "젊은 그대 김수철", "Bravo My Life 봄여름가을겨울", "일어나 김광석",
+        "걱정말아요 그대 전인권", "아름다운 강산 이선희", "바람이 불어오는 곳 김광석",
+    ],
+    "military": [
+        "전우야 잘자라 현인", "진짜 사나이 군가", "친구여 조용필", "젊은 그대 김수철",
+        "청춘 산울림", "일어나 김광석", "Bravo My Life 봄여름가을겨울",
+        "걱정말아요 그대 전인권", "바람이 불어오는 곳 김광석", "사랑했지만 김광석",
+    ],
+    "farewell": [
+        "너무 아픈 사랑은 사랑이 아니었음을 김광석", "사랑했지만 김광석", "잊혀진 계절 이용",
+        "옛사랑 이문세", "내 사랑 내 곁에 김현식", "그리움만 쌓이네 여진",
+        "가을 편지 최양숙", "인연 이선희", "이젠 안녕 015B", "서른 즈음에 김광석",
+    ],
+}
+
+
+DECADE_KOREAN_MUSIC_POOLS = {
+    "1970s": [
+        "님과 함께 남진", "고향역 나훈아", "아침이슬 양희은", "찔레꽃 백난아",
+        "타향살이 고복수", "여고시절 이수미", "그건 너 이장희", "아름다운 사람 서유석",
+        "행복의 나라로 한대수", "사랑으로 해바라기",
+    ],
+    "1980s": [
+        "젊은 그대 김수철", "잊혀진 계절 이용", "옛사랑 이문세", "사랑하기 때문에 유재하",
+        "내 사랑 내 곁에 김현식", "아름다운 강산 이선희", "그대 그리고 나 소리새",
+        "여행을 떠나요 조용필", "친구여 조용필", "그리움만 쌓이네 여진",
+    ],
+    "1990s": [
+        "이젠 안녕 015B", "친구 안재욱", "서른 즈음에 김광석", "사랑했지만 김광석",
+        "너무 아픈 사랑은 사랑이 아니었음을 김광석", "내 눈물 모아 서지원",
+        "기억의 습작 전람회", "난 알아요 서태지와 아이들", "잘못된 만남 김건모", "칵테일 사랑 마로니에",
+    ],
+    "2000s": [
+        "다행이다 이적", "청혼 노을", "출발 김동률", "걱정말아요 그대 전인권",
+        "좋은 날 아이유", "거리에서 성시경", "사랑은 늘 도망가 이문세", "보고싶다 김범수",
+        "제주도의 푸른 밤 성시경", "가족사진 김진호",
+    ],
+}
+
+
+def extract_music_year_info(text):
+    raw = str(text or "")
+    years = [int(match) for match in re.findall(r"(19[5-9]\d|20[0-2]\d)", raw)]
+    if years:
+        year = years[0]
+        return str(year), f"{(year // 10) * 10}s"
+    decade_patterns = [
+        (r"(70년대|1970년대|70's|70s)", "1970s"),
+        (r"(80년대|1980년대|80's|80s)", "1980s"),
+        (r"(90년대|1990년대|90's|90s)", "1990s"),
+        (r"(2000년대|00년대|2000s)", "2000s"),
+    ]
+    lowered = raw.lower()
+    for pattern, decade in decade_patterns:
+        if re.search(pattern, lowered):
+            return "", decade
+    return "", ""
+
+
+def normalize_music_decade(value):
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return ""
+    year, decade = extract_music_year_info(raw)
+    if decade:
+        return decade
+    match = re.search(r"(19[5-9]0|20[0-2]0)s?", raw)
+    if match:
+        return f"{match.group(1)}s"
+    return raw if raw in DECADE_KOREAN_MUSIC_POOLS else ""
+
+
+def infer_music_situation(text):
+    source = str(text or "").lower()
+    checks = [
+        ("birthday", ("생일", "돌잔치", "백일", "축하", "케이크", "촛불", "파티", "잔치", "birthday")),
+        ("wedding", ("결혼", "혼인", "웨딩", "신혼", "부부", "약혼", "예식", "wedding")),
+        ("travel", ("여행", "나들이", "소풍", "바다", "해변", "제주", "기차", "관광", "휴가", "travel", "trip")),
+        ("hometown", ("고향", "시골", "마을", "옛집", "고향집", "타향", "hometown")),
+        ("school", ("학교", "졸업", "입학", "교복", "학창", "동창", "친구", "운동장", "school", "graduation")),
+        ("military", ("군대", "군복", "군인", "전우", "훈련", "병장", "입대", "military")),
+        ("farewell", ("이별", "추모", "장례", "그립", "보고싶", "보고 싶", "떠나", "마지막", "눈물", "farewell")),
+        ("family", ("가족", "엄마", "어머니", "아빠", "아버지", "부모", "부모님", "아이", "아기", "딸", "아들", "family")),
+    ]
+    for situation, words in checks:
+        if any(word in source for word in words):
+            return situation
+    return "unclear"
+
+
+def fallback_music_plan_from_context(context):
+    source_text = " ".join([
+        str(context.get("label") or ""),
+        " ".join(context.get("keywords") or []),
+        " ".join(context.get("questions") or []),
+        str(context.get("answers") or ""),
+        str(context.get("note") or ""),
+        str(context.get("music_query") or ""),
+    ])
+    year, decade = extract_music_year_info(source_text)
+    situation = infer_music_situation(source_text)
+    direct_match = situation != "unclear"
+    if direct_match:
+        queries = list(SITUATION_MUSIC_POOLS.get(situation, []))
+    elif year or decade:
+        queries = list(DECADE_KOREAN_MUSIC_POOLS.get(decade, []))
+    else:
+        queries = random_music_queries(context, count=10)
+    return {
+        "direct_match": direct_match,
+        "detected_year": year,
+        "detected_decade": decade,
+        "situation": situation,
+        "queries": queries,
+    }
+
+
+def normalize_music_plan(data, context):
+    fallback_plan = fallback_music_plan_from_context(context)
+    if not isinstance(data, dict):
+        data = {}
+
+    direct_match = data.get("direct_match")
+    if not isinstance(direct_match, bool):
+        direct_match = bool(fallback_plan["direct_match"])
+
+    detected_year = str(data.get("detected_year") or fallback_plan["detected_year"] or "").strip()
+    detected_decade = normalize_music_decade(data.get("detected_decade") or fallback_plan["detected_decade"] or "")
+    if detected_year and not detected_decade:
+        try:
+            detected_decade = f"{(int(detected_year) // 10) * 10}s"
+        except Exception:
+            detected_decade = ""
+
+    situation = str(data.get("situation") or fallback_plan["situation"] or "unclear").strip().lower()
+    if situation not in set(SITUATION_MUSIC_POOLS.keys()) | {"unclear"}:
+        situation = fallback_plan["situation"] or "unclear"
+
+    gemini_queries = clean_music_queries(data.get("queries") or [])
+    if direct_match:
+        queries = clean_music_queries(gemini_queries + SITUATION_MUSIC_POOLS.get(situation, []))
+    elif detected_year or detected_decade:
+        decade_queries = DECADE_KOREAN_MUSIC_POOLS.get(detected_decade, [])
+        queries = clean_music_queries(decade_queries + gemini_queries)
+    else:
+        queries = clean_music_queries(random_music_queries(context, count=12) + gemini_queries)
+
+    if not queries:
+        queries = random_music_queries(context, count=10)
+
+    seed = music_context_seed(context) + "|" + detected_year + "|" + detected_decade + "|" + situation
+    queries = stable_shuffle(queries, "music_plan|" + seed)
+    return {
+        "direct_match": direct_match,
+        "detected_year": detected_year,
+        "detected_decade": detected_decade,
+        "situation": situation,
+        "queries": queries[:12],
+    }
 
 
 def current_music_context(memory=None):
@@ -2282,13 +2473,15 @@ def current_music_context(memory=None):
 def music_context_seed(context=None):
     context = context or {}
     source = "|".join([
-        str(st.session_state.get("music_random_salt") or ""),
         str(context.get("memory_id") or ""),
         str(context.get("photo_path") or ""),
         str(context.get("label") or ""),
         " ".join(context.get("keywords") or []),
+        " ".join(context.get("questions") or []),
         str(context.get("answers") or ""),
         str(context.get("note") or ""),
+        str(st.session_state.get("music_detected_year") or ""),
+        str(st.session_state.get("music_detected_decade") or ""),
     ])
     return hashlib.sha256(source.encode("utf-8")).hexdigest()
 
@@ -2318,7 +2511,11 @@ def ai_music_search_queries(memory=None):
     seed = music_context_seed(context)
 
     if not GEMINI_API_KEY:
-        queries = random_music_queries(context, count=10)
+        plan = normalize_music_plan({}, context)
+        st.session_state["music_detected_year"] = plan.get("detected_year", "")
+        st.session_state["music_detected_decade"] = plan.get("detected_decade", "")
+        st.session_state["music_situation"] = plan.get("situation", "unclear")
+        queries = plan["queries"]
         st.session_state["last_ai_music_query"] = " / ".join(queries[:3])
         return queries
 
@@ -2327,17 +2524,12 @@ def ai_music_search_queries(memory=None):
     questions = " / ".join(context.get("questions")[:3] or [])
     answers = context.get("answers") or ""
     note = context.get("note") or ""
-    previous_warning = """
-중요:
-- 이전에 저장했던 다른 사진/다른 기록 내용은 절대 참고하지 마.
-- 지금 전달한 사진과 지금 전달한 기록만 보고 골라.
-- 모든 추천 후보가 같은 분위기나 같은 가족/부모 노래로 반복되면 안 돼.
-- 추천할 만한 곡이 애매하면 아래 random_pool처럼 다양한 한국 노래 중에서 고르게 섞어.
-"""
+    fallback_plan = fallback_music_plan_from_context(context)
+    fallback_queries = ", ".join(random_music_queries(context, count=8))
 
     prompt = f"""
 너는 Re:Play의 음악 큐레이터야.
-현재 사진과 현재 사용자의 기록만 보고, Spotify 검색에 넣을 한국 노래 검색어 후보를 10개 만들어줘.
+현재 사진과 현재 사용자의 기록/답변만 보고, Spotify 검색에 넣을 "곡명 + 가수" 후보를 10개 만들어줘.
 
 사진 분석:
 - 장면: {label}
@@ -2347,31 +2539,46 @@ def ai_music_search_queries(memory=None):
 사용자 기록/답변:
 {answers or note or "직접 기록 없음. 사진 분석만 사용."}
 
-{previous_warning}
-
 규칙:
-- 결과는 반드시 한국 노래 위주.
-- 곡명 + 가수 형태를 우선. 예: "바람이 불어오는 곳 김광석"
-- 사진/기록과 맞는 후보를 앞쪽에 배치하되, 후보들이 서로 너무 비슷하면 안 됨.
-- "어머니", "아버지", "가족사진" 같은 가족 노래만 반복하지 마. 정말 가족/부모 기록일 때만 일부 포함.
+- 이전 사진, 이전 기록, 이전 추천 결과는 절대 참고하지 마.
+- 지금 전달한 사진과 지금 전달한 기록/답변만 사용해.
+- 직접적으로 어울리는 상황이 있으면 direct_match=true로 두고 그 상황에 맞는 한국 노래 후보를 골라.
+- 상황 예시는 birthday, family, travel, hometown, wedding, school, military, farewell.
+- 직접 상황이 애매하면 direct_match=false로 두고 기록/답변/사진에서 연도나 시대를 추출해.
+- 연도나 시대가 있으면 그 시절 한국 히트곡/추억곡 위주로 골라.
+- 연도도 상황도 애매하면 한국 추억 노래를 다양하게 섞어. 참고 후보: {fallback_queries}
+- 모든 queries는 반드시 "곡명 가수" 형태로 써. 예: "옛사랑 이문세"
 - 동요, 키즈, 교육용, 뽀로로, 핑크퐁, 100명의 위인들 같은 곡은 제외.
-- 기록이 생일이면 생일/축하/가족 분위기 3~4개 + 따뜻한 추억 노래를 섞어.
-- 기록이 여행이면 여행/길/바다/나들이 느낌 곡을 섞어.
-- 기록이 고향이면 고향/그리움/옛날가요 느낌 곡을 섞어.
-- 기록이 애매하면 무난한 한국 추억 노래를 다양하게 섞어.
 - 추천 이유는 쓰지 마.
 - 반드시 JSON만 반환.
 
 형식:
-{{"queries":["곡명 가수","곡명 가수","곡명 가수","곡명 가수","곡명 가수","곡명 가수","곡명 가수","곡명 가수","곡명 가수","곡명 가수"]}}
+{{
+  "direct_match": true,
+  "detected_year": "1988",
+  "detected_decade": "1980s",
+  "situation": "birthday/family/travel/hometown/wedding/school/military/farewell/unclear",
+  "queries": [
+    "곡명 가수",
+    "곡명 가수",
+    "곡명 가수",
+    "곡명 가수",
+    "곡명 가수",
+    "곡명 가수",
+    "곡명 가수",
+    "곡명 가수",
+    "곡명 가수",
+    "곡명 가수"
+  ]
+}}
 """
     data = ask_gemini_json(prompt, image_path=context.get("photo_path"), timeout=35)
-    queries = clean_music_queries((data or {}).get("queries") or [])
-
-    # Gemini가 너무 적게 주거나 이상하면 현재 사진/기록 seed 기반 랜덤 풀로 채운다.
-    random_queries = random_music_queries(context, count=12)
-    queries = clean_music_queries(queries + random_queries)
-
+    plan = normalize_music_plan(data or fallback_plan, context)
+    queries = plan["queries"]
+    st.session_state["music_detected_year"] = plan.get("detected_year", "")
+    st.session_state["music_detected_decade"] = plan.get("detected_decade", "")
+    st.session_state["music_situation"] = plan.get("situation", "unclear")
+    st.session_state["music_direct_match"] = plan.get("direct_match", False)
     st.session_state["last_ai_music_query"] = " / ".join(queries[:4])
     return queries[:12]
 
@@ -6640,7 +6847,6 @@ elif page == "music":
         recorded_text_for_music(memory),
         str(memory.get("analysis_label") or st.session_state.get("analysis_label") or ""),
         " ".join(str(item) for item in (memory.get("keywords") or st.session_state.get("keywords") or [])),
-        str(st.session_state.get("music_random_salt") or ""),
     ])
     if (
         st.session_state.get("music_recommend_signature") != music_recommend_signature
