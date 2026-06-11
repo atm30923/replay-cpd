@@ -1,5 +1,6 @@
 ﻿import base64
 import hashlib
+import io
 import random
 import json
 import os
@@ -464,10 +465,29 @@ def image_src(path):
 
 
 def save_photo(file):
+    """Save uploaded photo once.
+
+    iPad Safari에서는 file_uploader가 파일 선택 직후 다시 rerun되면
+    업로드 상태가 한 번 씹히는 경우가 있어서, 파일 객체/bytes를 모두 안정적으로 처리한다.
+    """
     memory_id = str(uuid.uuid4())[:8]
     path = local_photo_path_for(memory_id)
-    image = Image.open(file).convert("RGB")
-    image.save(path, quality=92)
+
+    try:
+        if isinstance(file, (bytes, bytearray)):
+            image_source = io.BytesIO(file)
+        else:
+            try:
+                file.seek(0)
+            except Exception:
+                pass
+            image_source = file
+        image = Image.open(image_source).convert("RGB")
+        image.save(path, quality=92)
+    except Exception:
+        st.session_state.scan_upload_notice = "사진을 불러오지 못했어요. 다른 사진으로 다시 선택해주세요."
+        return None
+
     st.session_state.memory_id = memory_id
     st.session_state.photo_path = path
 
@@ -491,6 +511,7 @@ def save_photo(file):
     st.session_state.music_show_more = False
     st.session_state.question_random_salt = str(uuid.uuid4())[:8]
     st.session_state.music_random_salt = str(uuid.uuid4())[:8]
+    return path
 
 
 def restore_photo(memory_id):
@@ -5403,24 +5424,48 @@ div[data-testid="stVerticalBlock"] {{ gap:0 !important; }}
         label_visibility="collapsed",
         key="scan_photo_uploader",
     )
-    if file:
-        signature = f"{file.name}:{file.size}"
-        if signature != st.session_state.upload_signature:
+    if file is not None:
+        try:
+            file_bytes = file.getvalue()
+        except Exception:
+            file_bytes = b""
+        signature_hash = hashlib.sha256(file_bytes).hexdigest()[:12] if file_bytes else str(time.time())
+        signature = f"{getattr(file, 'name', 'photo')}:{len(file_bytes)}:{signature_hash}"
+
+        # iPad에서는 파일 선택 직후 강제 rerun하면 첫 업로드가 반영되지 않는 경우가 있어서
+        # 여기서는 즉시 저장만 하고 rerun하지 않는다.
+        if signature != st.session_state.get("upload_signature"):
             st.session_state.upload_signature = signature
             st.session_state.scan_upload_notice = ""
             st.session_state.analysis_done = False
             st.session_state.suggested_categories = []
             st.session_state.music_query = ""
-            save_photo(file)
-            st.rerun()
+            saved_path = save_photo(file_bytes)
+            if saved_path:
+                st.session_state.scan_upload_notice = "사진이 선택됐어요. 스캔하기를 눌러주세요."
+
     html('<div class="scan-upload-down">▢</div>')
     if st.button("스캔하기", key="scan_start_button"):
+        # 버튼 클릭 시점에 file_uploader 파일이 있는데 아직 저장이 안 됐으면 한 번 더 저장
+        if not media_reference_available(st.session_state.get("photo_path")) and file is not None:
+            try:
+                file_bytes = file.getvalue()
+            except Exception:
+                file_bytes = b""
+            if file_bytes:
+                save_photo(file_bytes)
+
         if media_reference_available(st.session_state.get("photo_path")):
+            st.session_state.scan_upload_notice = ""
             go("scan_running")
         else:
             st.session_state.scan_upload_notice = "사진을 먼저 선택해주세요."
     if st.session_state.get("scan_upload_notice"):
-        st.warning(st.session_state.scan_upload_notice)
+        notice_text = str(st.session_state.scan_upload_notice)
+        if "선택됐어요" in notice_text:
+            html(f'<div style="text-align:center;color:#777;font-size:13px;font-weight:900;margin-top:10px;">{escape(notice_text)}</div>')
+        else:
+            st.warning(notice_text)
 
 elif page == "scan_running":
     # 스캔 중에도 화면 비율이 바뀌지 않도록 scan_upload 화면과 같은 틀을 그대로 사용한다.
