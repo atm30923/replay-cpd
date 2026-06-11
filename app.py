@@ -514,6 +514,45 @@ def save_photo(file):
     return path
 
 
+
+def handle_scan_photo_upload(uploader_key="scan_photo_uploader"):
+    """iPad Safari 대응: 파일 선택 이벤트에서 바로 사진을 저장한다."""
+    file = st.session_state.get(uploader_key)
+    if file is None:
+        return
+
+    try:
+        file_bytes = file.getvalue()
+    except Exception:
+        file_bytes = b""
+
+    if not file_bytes:
+        return
+
+    signature_hash = hashlib.sha256(file_bytes).hexdigest()[:12]
+    signature = f"{getattr(file, 'name', 'photo')}:{len(file_bytes)}:{signature_hash}"
+
+    # 같은 파일이고 이미 저장된 사진이 있으면 다시 저장하지 않는다.
+    if (
+        signature == st.session_state.get("upload_signature")
+        and media_reference_available(st.session_state.get("photo_path"))
+    ):
+        return
+
+    st.session_state.scan_upload_notice = ""
+    st.session_state.analysis_done = False
+    st.session_state.suggested_categories = []
+    st.session_state.music_query = ""
+
+    saved_path = save_photo(file_bytes)
+    if saved_path:
+        # 저장 성공 후에만 signature를 업데이트해야 첫 업로드 실패 시 재시도가 막히지 않는다.
+        st.session_state.upload_signature = signature
+        st.session_state.scan_upload_notice = "사진이 선택됐어요. 스캔하기를 눌러주세요."
+    else:
+        st.session_state.upload_signature = None
+
+
 def restore_photo(memory_id):
     if not memory_id:
         return
@@ -5423,26 +5462,26 @@ div[data-testid="stVerticalBlock"] {{ gap:0 !important; }}
         type=["jpg", "jpeg", "png"],
         label_visibility="collapsed",
         key="scan_photo_uploader",
+        on_change=handle_scan_photo_upload,
+        args=("scan_photo_uploader",),
     )
     if file is not None:
+        # 콜백이 놓치는 모바일 브라우저 상황까지 대비해서 한 번 더 확인한다.
         try:
             file_bytes = file.getvalue()
         except Exception:
             file_bytes = b""
-        signature_hash = hashlib.sha256(file_bytes).hexdigest()[:12] if file_bytes else str(time.time())
-        signature = f"{getattr(file, 'name', 'photo')}:{len(file_bytes)}:{signature_hash}"
-
-        # iPad에서는 파일 선택 직후 강제 rerun하면 첫 업로드가 반영되지 않는 경우가 있어서
-        # 여기서는 즉시 저장만 하고 rerun하지 않는다.
-        if signature != st.session_state.get("upload_signature"):
-            st.session_state.upload_signature = signature
-            st.session_state.scan_upload_notice = ""
-            st.session_state.analysis_done = False
-            st.session_state.suggested_categories = []
-            st.session_state.music_query = ""
-            saved_path = save_photo(file_bytes)
-            if saved_path:
-                st.session_state.scan_upload_notice = "사진이 선택됐어요. 스캔하기를 눌러주세요."
+        if file_bytes:
+            signature_hash = hashlib.sha256(file_bytes).hexdigest()[:12]
+            signature = f"{getattr(file, 'name', 'photo')}:{len(file_bytes)}:{signature_hash}"
+            if (
+                signature != st.session_state.get("upload_signature")
+                or not media_reference_available(st.session_state.get("photo_path"))
+            ):
+                saved_path = save_photo(file_bytes)
+                if saved_path:
+                    st.session_state.upload_signature = signature
+                    st.session_state.scan_upload_notice = "사진이 선택됐어요. 스캔하기를 눌러주세요."
 
     html('<div class="scan-upload-down">▢</div>')
     if st.button("스캔하기", key="scan_start_button"):
@@ -5453,7 +5492,10 @@ div[data-testid="stVerticalBlock"] {{ gap:0 !important; }}
             except Exception:
                 file_bytes = b""
             if file_bytes:
-                save_photo(file_bytes)
+                saved_path = save_photo(file_bytes)
+                if saved_path:
+                    signature_hash = hashlib.sha256(file_bytes).hexdigest()[:12]
+                    st.session_state.upload_signature = f"{getattr(file, 'name', 'photo')}:{len(file_bytes)}:{signature_hash}"
 
         if media_reference_available(st.session_state.get("photo_path")):
             st.session_state.scan_upload_notice = ""
